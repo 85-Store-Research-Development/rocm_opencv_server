@@ -194,6 +194,7 @@ uv run python -m scripts.item_subtype_report [--subtypes subtypes.json]
 - 分け方: 撮影時刻の順に並べ、「人が写っていない全体の正面（向きの確からしさ 0.6 以上）が、すでに正面のある商品のあとに来た」か「前の写真から 5 分以上あいた」ところで次の商品にする。全体の正面が無い商品は、CMS の画面で目立たせる
 - 品目は 85crm の品目の一覧（CMS が渡す）から選ぶ。状態メモの候補は `scripts/shopify_condition_drafts.py` と同じ質問と文の型。ブランドは `--brand` のときだけ（`--eval-brands N` で当たり方を測ってから）
 - 写真は CMS の縮小版（`/api/photoSources/:id/preview`）で受け取るので、DNG もそのまま読める
+- タグの文字（ブランド名・素材・原産国・サイズ）は、Clef を GPU から下ろしてから Qwen3-VL-8B-Instruct（`app/tag_reader.py`。BF16 で約 17GB）で読み、`brandName`・`material`（「Cotton 100%」の形にそろえる。% の無いものは捨てる）・`originCountry`・`tagSize` として返す。CMS が下書きを作るときに欄に入れる。重みが無ければ読まずに進める。入れ方: `HF_HUB_DISABLE_XET=1 .venv/bin/hf download Qwen/Qwen3-VL-8B-Instruct --local-dir ~/models/qwen3-vl-8b-instruct`（Xet だと途中で止まった。置き場所は `TAG_READER_MODEL_PATH` で変えられる）。作成済みのまとまりには `python -m scripts.cms_photo_batches --read-tags-batch <ID>`（`--dry-run` で表示だけ）。2026-11-14 の 15 着で、ブランドは 14 着・原産国は 12 着・素材は 7 着が読めた
 - 1 分ごとに systemd のユーザーのタイマーで起こす（`deploy/cms-photo-batches.{service,timer}`。入れ方は service の先頭）。分け待ちが無ければ Clef を読み込まずに終わり、GPU の空きが 21GB 未満ならその回は見送る（終わったらプロセスごと GPU を手放す）
 
 ```bash

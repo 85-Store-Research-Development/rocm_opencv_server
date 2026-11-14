@@ -27,6 +27,10 @@
   （状態ランクはまだ無いので既定のしきい値）
 - ブランドは --brand のときだけ（登録されているブランドから選ばせる。
   当たり方を --eval-brands で測ってから使う）
+- タグの文字（ブランド名・素材・原産国・サイズ）は、Clef を GPU から下ろしてから Qwen3-VL で読む
+  （app/tag_reader.py。重みが無ければ読まない）。brandName・material・originCountry・tagSize
+  として返し、
+  CMS が下書きを作るときに欄に入れる。作成済みのまとまりには --read-tags-batch ID であとから入れる
 - CMS へは PC の端末として tailnet の whois で通る（トークンは要らない）
 """
 
@@ -42,7 +46,7 @@ from pathlib import Path
 import cv2
 import httpx2 as httpx
 
-from app import clef, processing, shopify
+from app import clef, processing, shopify, tag_reader
 from app.config import settings
 from scripts import shopify_condition_drafts as condition
 
@@ -272,6 +276,16 @@ class Cms:
         res.raise_for_status()
         return res.json()
 
+    def workspace(self, batch_id: int) -> dict:
+        res = self.http.get(f"{CMS_URL}/api/photoBatches/{batch_id}/workspace")
+        res.raise_for_status()
+        return res.json()
+
+    def tags(self, batch_id: int, items: list[dict]) -> dict:
+        res = self.http.post(f"{CMS_URL}/api/photoBatches/{batch_id}/tags", json={"items": items})
+        res.raise_for_status()
+        return res.json()
+
     def claim(self, batch_id: int) -> bool:
         res = self.http.post(f"{CMS_URL}/api/photoBatches/{batch_id}/claim")
         if res.status_code == 409:
@@ -297,7 +311,9 @@ class Cms:
         )
 
 
-def build_groups(model, batch: dict, choices: dict, cms: Cms, brand: bool) -> list[dict]:
+def build_groups(
+    model, batch: dict, choices: dict, cms: Cms, brand: bool
+) -> tuple[list[dict], list[Group]]:
     photos = [
         Photo(s["id"], s.get("filename") or "", parse_time(s.get("takenAt")))
         for s in batch["sources"]
@@ -316,7 +332,8 @@ def build_groups(model, batch: dict, choices: dict, cms: Cms, brand: bool) -> li
         return float(model.ask(SAME_STATE, SAME_QUESTIONS, pics)["same"]["noul"])
 
     out = []
-    for i, group in enumerate(split_groups(photos, same), start=1):
+    groups = split_groups(photos, same)
+    for i, group in enumerate(groups, start=1):
         item: dict = {
             "key": f"g{i}",
             "sources": [{"id": p.id, "label": p.label} for p in group.photos],
@@ -345,7 +362,64 @@ def build_groups(model, batch: dict, choices: dict, cms: Cms, brand: bool) -> li
             flush=True,
         )
         out.append(item)
-    return out
+    return out, groups
+
+
+TAG_LABEL = "タグのアップ"
+MAX_TAG_PHOTOS = 3
+
+
+def tag_images(photos: list[Photo]) -> list[bytes]:
+    """タグのアップの写真（Clef の判定が tag）。無ければ空。"""
+    return [p.image for p in photos if p.label == TAG_LABEL][:MAX_TAG_PHOTOS]
+
+
+def reading_fields(reading: dict) -> dict:
+    """読んだ値 → CMS の分けた案（BatchGroup）の欄。"""
+    return {
+        "brandName": reading.get("brand"),
+        # 「100% COTTON/COTON」→「Cotton 100%」。% の無いもの（素材でない文字）は捨てる
+        "material": tag_reader.normalize_material(reading.get("material")),
+        "originCountry": reading.get("origin_code"),
+        "tagSize": reading.get("size"),
+    }
+
+
+def release_gpu() -> None:
+    """下ろしたモデルの GPU のメモリを返す（タグを読むモデルと同時には載らない）。"""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def open_tag_reader():
+    """タグを読むモデル。重みが無い・読み込めないときは None（タグは読まずに進める）。"""
+    path = os.getenv("TAG_READER_MODEL_PATH", tag_reader.DEFAULT_MODEL_PATH)
+    try:
+        return tag_reader.TagReader(path)
+    except tag_reader.TagReaderError as e:
+        print(f"タグは読みません: {e}", flush=True)
+        return None
+
+
+def read_tags(reader, items: list[dict], groups: list[Group]) -> None:
+    for i, (item, group) in enumerate(zip(items, groups, strict=True), start=1):
+        images = tag_images(group.photos)
+        if not images:
+            continue
+        try:
+            reading = reader.read(images)
+        except tag_reader.TagReaderError as e:
+            print(f"#{i} タグを読めませんでした: {e}", flush=True)
+            continue
+        item.update({k: v for k, v in reading_fields(reading).items() if v})
+        print(f"#{i} タグ: {reading_fields(reading)}", flush=True)
 
 
 def run_once(dry_run: bool, brand: bool) -> int:
@@ -364,7 +438,13 @@ def run_once(dry_run: bool, brand: bool) -> int:
         return 0
     try:
         model = clef.from_settings(settings)
-        groups = build_groups(model, batch, queue, cms, brand)
+        groups, garments = build_groups(model, batch, queue, cms, brand)
+        del model  # Clef を GPU から下ろしてから、タグを読むモデルを載せる
+        release_gpu()
+        reader = open_tag_reader()
+        if reader:
+            read_tags(reader, groups, garments)
+            reader.close()
     except Exception as e:  # noqa: BLE001 失敗は CMS に知らせて、人が自分で分けられるようにする
         if not dry_run:
             cms.error(batch["id"], f"Clef で分けられませんでした: {e}")
@@ -430,6 +510,40 @@ def eval_brands(limit: int) -> int:
     return 0
 
 
+def read_tags_of_batch(batch_id: int, dry_run: bool) -> int:
+    """作成済みのまとまりの下書きに、あとからタグの値を入れる（CMS は保留中の空の欄だけ変える）。"""
+    cms = Cms()
+    ws = cms.workspace(batch_id)
+    groups = [g for g in ws["batch"].get("groups") or [] if g.get("product")]
+    print(f"まとまり #{batch_id}: 下書き {len(groups)} 件", flush=True)
+    reader = open_tag_reader()
+    if reader is None:
+        return 1
+    items = []
+    for g in groups:
+        labels = g.get("labels") or {}
+        ids = [i for i in g["sources"] if labels.get(str(i)) == TAG_LABEL][:MAX_TAG_PHOTOS]
+        if not ids:
+            print(f"  商品 {g['product']}: タグの写真がありません", flush=True)
+            continue
+        images = [cms.preview(f"/api/photoSources/{i}/preview?max=1280") for i in ids]
+        try:
+            fields = reading_fields(reader.read(images))
+        except tag_reader.TagReaderError as e:
+            print(f"  商品 {g['product']}: 読めませんでした: {e}", flush=True)
+            continue
+        print(f"  商品 {g['product']}: {fields}", flush=True)
+        items.append({"product": g["product"], **fields})
+    reader.close()
+    if dry_run:
+        print("確認だけ（CMS には送っていません）")
+        return 0
+    for r in cms.tags(batch_id, items)["results"]:
+        done = f"入れた {r.get('fields')}" if r["updated"] else r.get("reason")
+        print(f"  商品 {r['product']}: {done}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -443,7 +557,15 @@ def main() -> int:
     parser.add_argument(
         "--eval-brands", type=int, metavar="N", help="今ある商品 N 件で、ブランドの当たり方を測る"
     )
+    parser.add_argument(
+        "--read-tags-batch",
+        type=int,
+        metavar="ID",
+        help="作成済みのまとまりの下書きに、タグの値をあとから入れる（--dry-run で表示だけ）",
+    )
     args = parser.parse_args()
+    if args.read_tags_batch:
+        return read_tags_of_batch(args.read_tags_batch, args.dry_run)
     if args.eval_brands:
         return eval_brands(args.eval_brands)
     return run_once(args.dry_run, args.brand)

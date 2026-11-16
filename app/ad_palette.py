@@ -179,29 +179,40 @@ def choose_palette(
     lights: list[float | None],
     options: list[str] | None = None,
 ) -> tuple[str, str | None]:
-    """(使う色, 替えた理由)。理由は替えなかったら None。
+    """(使う色, 替えた理由)。理由は使う色がブリーフの palette のままなら None。
 
-    候補 = ブリーフの palette_options（知っている名前だけ。無ければ同じ明暗の系統）。
-    要求の色で沈む商品が無ければ替えない。沈む商品があるとき、候補のうち沈む商品がより少ない色
-    （同数なら地との明暗差の合計が大きい色）があれば、その色に替える。"""
-    known = [n for n in (options or []) if n in PALETTES]
-    cands = known if known else list(palette_family(requested))
-    if requested not in cands:
-        cands = [requested, *cands]
+    ブリーフの palette_options（CRM がその季節の候補を並べたもの。知っている名前だけ）があれば、
+    **その中だけ**で沈む商品がいちばん少ない色を選ぶ（同数なら並びの前のほう）。候補に明るい地
+    （cream・sky）があれば、暗い服が多い案でそれを選んでよい。
+    無いときだけ従来どおり: 要求の色で沈む商品が無ければ替えず、あれば同じ明暗の系統から、
+    沈む商品がより少なくなる色（同数なら地との明暗差の合計が大きい色）があればそれに替える。"""
+    known = [n for n in dict.fromkeys(options or []) if n in PALETTES]
 
     def sunk(n: str) -> int:
         return sum(1 for ll in lights if sinks(ll, PALETTES[n].bg))
 
+    n_items = sum(1 for ll in lights if ll is not None)
+    if known:
+        best = min(known, key=lambda n: (sunk(n), known.index(n)))
+        if best == requested:
+            return requested, None
+        return best, (
+            f"候補 {' / '.join(known)} のうち {best} が沈む商品がいちばん少ない"
+            f"（{n_items} 点中 {sunk(best)} 点。{requested} では {sunk(requested)} 点）"
+        )
+
     def gap_sum(n: str) -> float:
         return sum(sink_gap(ll, PALETTES[n].bg) for ll in lights if ll is not None)
 
+    cands = list(palette_family(requested))
+    if requested not in cands:
+        cands = [requested, *cands]
     base = sunk(requested)
     if base == 0:
         return requested, None
     best = min(cands, key=lambda n: (sunk(n), -gap_sum(n), cands.index(n)))
     if sunk(best) >= base:
         return requested, None
-    n_items = sum(1 for ll in lights if ll is not None)
     reason = (
         f"{requested} の地では {base} 点（{n_items} 点中）が沈むため {best} に替えた"
         f"（沈む商品 {sunk(best)} 点）"

@@ -218,6 +218,10 @@ uv run --group clip --group clef-local python -m scripts.ad_compose \
 
 - ブリーフ: `id` / `format` / `store{name,tagline,area_line}` / `headline`（2行まで）/ `aside` / `palette`（上の 10 色）/ `items[{id,image,label,item_type}]`（2〜6点）/ `seed` / `candidates`。
   商品は切り抜き（判定が check / fail は外して結果に残す）をキャッシュ（`data/ad-cutout-cache`）して使う
+- 輪郭に沿う文字: 流す区間は、輪郭の始点・終点をまたがない連続した1本の弧。文字より短い弧・逆さになる区間（下辺を右から
+  左へ流れる所）・曲がりが急な弧・自分の商品に食い込む弧（輪郭からの離れは文字の大きさに合わせる）は使わない。どこにも無ければ
+  文字を小さくし、それでも無理なら商品の上か下に少し傾けてまっすぐ置く（`layout.json` の `label_straight`）。検査は
+  「ラベルの全文字が弧に収まる」「逆さに流れない」も見る
 - 季節感（任意）: ブリーフの `season`（`{motif, label, stamp, weather_line, stage, tmax, tmin, trend, estimated}`）を
   読む。`motif` は `early_spring` / `spring` / `early_summer` / `summer` / `late_summer` / `autumn` / `late_autumn` /
   `winter` / `midwinter`。無い・知らない値なら季節なし（従来の見た目）。motif ごとに 6 種類以上の手描きの落書き
@@ -229,8 +233,8 @@ uv run --group clip --group clef-local python -m scripts.ad_compose \
   文字・アクセント・線と地の明暗比は 4.5:1 以上（テストで確認。`app/ad_palette.py`）
 - 服が地に沈まないようにする: 切り抜きの画素から、アルファで重み付けした明るさ（L* の中央値）を測り、地との差が
   24 未満の商品を「沈む」とする（商品の `tone`＝dark / mid / light は画素から測れないときの手がかり）。沈む商品があれば
-  まず色を替える（ブリーフの `palette_options` の中から。無ければ同じ明暗の系統から、沈む商品がより少なくなる色。
-  よくならなければ替えない）。替えても沈む商品は、縁に地よりわずかに明るい（明るい地では暗い）ぼかしの光の縁取りを足す
+  色は `palette_options`（その季節の候補の並び）があればその中だけで、沈む商品がいちばん少ない色（同数なら並びの前）を
+  選ぶ。無いときだけ、沈む商品があれば同じ明暗の系統から沈む商品がより少なくなる色に替える（よくならなければ替えない）。替えても沈む商品は、縁に地よりわずかに明るい（明るい地では暗い）ぼかしの光の縁取りを足す
   （**商品の画素は変えない**）。検査の点数には「商品と地の明暗の差」を 1 割混ぜる。使った色は `layout.json` と CRM への
   `meta` の `palette_used` / `palette_changed_reason`（替えなければ null）に残る
 - 切り抜きの縁（白い服の襟元の欠け）には、背景除去専用の BiRefNet（`ZhengPeng7/BiRefNet`・MIT）を使える。重みは

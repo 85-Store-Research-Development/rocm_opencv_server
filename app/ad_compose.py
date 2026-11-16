@@ -105,7 +105,15 @@ SHRINK = 0.92
 
 # 輪郭に沿う文字
 CONTOUR_OFFSET = 20  # 服の輪郭から文字の土台までの距離（px）
+CONTOUR_OFFSET_PAD = (
+    12  # 輪郭からの離れの下限は、文字の内側の張り出し（BAND_DOWN × 文字の大きさ）+ これ
+)
 CONTOUR_STEP = 6  # 輪郭の点の間隔（px）
+UPSIDE_MAX = 0.1  # 逆さになる区間（下辺を右から左へ流れる所）がこの割合を超える弧は使わない
+MAX_WINDOW_TURN = 4.5  # 1本の弧の曲がりの合計（rad）の上限。角を回り込むと文字が詰まる
+STRAIGHT_FROM_ATTEMPT = 3  # 商品を縮めてもだめなら、この試行から先は商品の上下にまっすぐ置いてよい
+STRAIGHT_GAP = 14  # 輪郭に沿わせられないとき、商品の上下にまっすぐ置く文字との間
+STRAIGHT_TILTS = (-3.0, 0.0, 3.0)
 BAND_UP = 0.9  # 文字の占める帯: 土台から外側へ 文字の大きさ × これ
 BAND_DOWN = 0.3  # 内側へ
 UPSIDE_PENALTY = 6000.0  # 逆さになる区間（長さの割合）への罰（px² 相当）
@@ -519,6 +527,11 @@ def contour_local(
     pool = top if len(top) else np.arange(len(c))
     start = pool[int(np.argmin(c[pool, 0]))]
     return float(w), np.roll(c, -start, axis=0)
+
+
+def offset_for(fs: int) -> int:
+    """輪郭から文字の土台までの距離。文字が大きいほど離す（文字が商品の内側へ食い込まないように）。"""
+    return round(max(CONTOUR_OFFSET, BAND_DOWN * fs + CONTOUR_OFFSET_PAD))
 
 
 def signed_area(c: np.ndarray) -> float:
@@ -1041,10 +1054,17 @@ class ItemState:
     text_len: float = 0.0
     cost: float = 0.0
     placed: bool = False
+    straight: bool = False  # 輪郭に沿わせられず、商品の上か下にまっすぐ置いた文字
+    contours: dict = field(default_factory=dict)  # 文字の大きさごとの輪郭（商品の座標）
     glow: bool = False  # 地に沈むので、縁にやわらかい光の縁取りを足す（画素は変えない）
 
     def __post_init__(self):
         self.w = self.sprite.alpha.shape[1] * self.h / self.sprite.alpha.shape[0]
+
+    def contour_for(self, fs: int) -> np.ndarray:
+        if fs not in self.contours:
+            self.contours[fs] = contour_local(self.sprite.alpha, round(self.h), offset_for(fs))[1]
+        return self.contours[fs]
 
     def half_extent(self) -> tuple[float, float]:
         c, s = abs(math.cos(math.radians(self.angle))), abs(math.sin(math.radians(self.angle)))
@@ -1171,49 +1191,163 @@ def window_cost(band: Band, occ: Occupancy, pts: np.ndarray) -> tuple[float, flo
     return bad, bad + UPSIDE_PENALTY * upside_fraction(pts) + CONCAVE_PENALTY * concave_turn(pts)
 
 
+def total_turn(pts: np.ndarray) -> float:
+    """弧の曲がりの合計（rad。向きを問わない）。"""
+    t = np.diff(pts, axis=0)
+    ang = np.unwrap(np.arctan2(t[:, 1], t[:, 0]))
+    return float(np.sum(np.abs(np.diff(ang))))
+
+
+def arc_length(pts: np.ndarray) -> float:
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
+
+def inside_distance(mask: np.ndarray, pad: int = 60) -> tuple[np.ndarray, int, int]:
+    """商品のマスクの外の各画素から、商品までの距離（商品の中は 0）。商品の外接矩形 + pad の範囲だけ
+    測る（範囲の外は pad より遠いので十分）。戻り値は (距離, 左上の x, y)。"""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return np.full((1, 1), 1e6, np.float32), 0, 0
+    x0, y0 = max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad)
+    x1, y1 = (
+        min(mask.shape[1], int(xs.max()) + pad + 1),
+        min(mask.shape[0], int(ys.max()) + pad + 1),
+    )
+    crop = mask[y0:y1, x0:x1]
+    return cv2.distanceTransform((~crop).astype(np.uint8), cv2.DIST_L2, 3), x0, y0
+
+
+def window_ok(seg: np.ndarray, fs: int, dist: tuple[np.ndarray, int, int] | None) -> bool:
+    """輪郭に沿わせてよい弧か。逆さ・急な曲がり・自分の商品への食い込みは使わない。"""
+    if upside_fraction(seg) > UPSIDE_MAX or total_turn(seg) > MAX_WINDOW_TURN:
+        return False
+    if dist is not None:
+        d, x0, y0 = dist
+        h, w = d.shape
+        ix, iy = np.rint(seg[:, 0]).astype(int) - x0, np.rint(seg[:, 1]).astype(int) - y0
+        inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)  # 範囲の外は遠い
+        vals = d[iy[inside], ix[inside]]
+        if len(vals) and float(vals.min()) < BAND_DOWN * fs:
+            return False
+    return True
+
+
 def best_window(
-    it: ItemState, label_w: float, fs: int, occ: Occupancy
+    it: ItemState, label_w: float, fs: int, occ: Occupancy, dist: tuple | None = None
 ) -> tuple[float, float, int, np.ndarray, Band] | None:
-    """輪郭の上で、文字が流れる区間をいちばん良い位置に選ぶ。(bad, cost, start, arc 点, 帯)。"""
-    pts = to_canvas(it.contour, it.w, it.h, it.cx, it.cy, it.angle)
+    """輪郭の上で、文字が流れる区間をいちばん良い位置に選ぶ。(bad, cost, start, arc 点, 帯)。
+
+    区間は輪郭の始点・終点をまたがない連続した1本の弧。輪郭を半周ずらした並びからも切り出すので、
+    どの場所も区間になれる。長さが文字の長さ（余裕込み）に足りない輪郭は使わない。"""
+    pts = to_canvas(it.contour_for(fs), it.w, it.h, it.cx, it.cy, it.angle)
     n = len(pts)
     text_len = label_w * TEXT_LEN_SAFETY
     m = int(math.ceil(text_len * 1.04 / CONTOUR_STEP)) + 1
     if m > n - 2:
         return None
     best = None
-    for s in range(0, n, 2):
-        idx = (s + np.arange(m)) % n
-        seg = pts[idx]
-        band = raster_band(seg, fs)
-        bad, cost = window_cost(band, occ, seg)
-        cost += 0.01 * s  # 同じなら、上の左から始まる（読みやすい）ほうへ
-        if best is None or cost < best[1]:
-            best = (bad, cost, s, seg, band)
+    for shift in (0, n // 2):
+        order = np.roll(pts, -shift, axis=0)
+        for s in range(0, n - m + 1, 2):
+            seg = order[s : s + m]
+            if arc_length(seg) < text_len or not window_ok(seg, fs, dist):
+                continue
+            band = raster_band(seg, fs)
+            bad, cost = window_cost(band, occ, seg)
+            cost += 0.01 * ((s + shift) % n)  # 同じなら、上の左から始まる（読みやすい）ほうへ
+            if best is None or cost < best[1]:
+                best = (bad, cost, (s + shift) % n, seg, band)
     return best
+
+
+def contour_feasible(it: ItemState, ms: Measurer, size: tuple[int, int], steps) -> bool:
+    """輪郭に沿わせてよい弧（逆さ・急な曲がり・食い込みが無い）が、この商品にどこかにあるか。
+    商品を少し動かしても変わらない（形だけで決まる）ので、先に調べて、無理なら探し直さない。"""
+    dist = inside_distance(it.mask(size))
+    for fs in steps:
+        text_len = ms.width("hand", it.sprite.label, fs) * TEXT_LEN_SAFETY
+        pts = to_canvas(it.contour_for(fs), it.w, it.h, it.cx, it.cy, it.angle)
+        n = len(pts)
+        m = int(math.ceil(text_len * 1.04 / CONTOUR_STEP)) + 1
+        if m > n - 2:
+            continue
+        for shift in (0, n // 2):
+            order = np.roll(pts, -shift, axis=0)
+            for st in range(0, n - m + 1, 2):
+                seg = order[st : st + m]
+                if arc_length(seg) >= text_len and window_ok(seg, fs, dist):
+                    return True
+    return False
 
 
 def _place_text(
     it: ItemState, ms: Measurer, occ: Occupancy, steps: tuple[int, ...] = LABEL_STEPS
 ) -> bool:
     """商品 it の文字の区間を選んで占有マップに書く。許容内に収まれば True。"""
+    dist = inside_distance(it.mask(occ.size))
     for fs in steps:
         label_w = ms.width("hand", it.sprite.label, fs)
-        best = best_window(it, label_w, fs, occ)
+        best = best_window(it, label_w, fs, occ, dist)
         if best is None:
             continue
         bad, cost, start, seg, band = best
         if bad <= TOLERANCE_PX:
-            pts = to_canvas(it.contour, it.w, it.h, it.cx, it.cy, it.angle)
+            pts = to_canvas(it.contour_for(fs), it.w, it.h, it.cx, it.cy, it.angle)
             n = len(pts)
             m_arc = min(
                 n - 1, int(math.ceil(label_w * TEXT_LEN_SAFETY * ARC_SLACK / CONTOUR_STEP)) + 1
             )
-            it.arc = pts[(start + np.arange(m_arc)) % n]
+            arc = pts[(start + np.arange(m_arc)) % n]
+            # 描く弧も、始点・終点をまたがない連続した1本にする（またぐ分は切る）
+            if start + m_arc > n:
+                arc = seg
+            it.arc = arc
             it.fs, it.text_len, it.cost, it.placed = fs, label_w * TEXT_LEN_SAFETY, cost, True
+            it.straight = False
             band.paint(occ.text)
             return True
     return False
+
+
+def _place_straight(it: ItemState, ms: Measurer, occ: Occupancy, geo: Geo) -> bool:
+    """輪郭に沿わせられないとき、商品の上か下に、少し傾けてまっすぐ置く（左から右へ読む向き）。
+    大きい段から試し、置けた最初の段を使う。"""
+    return any(_place_straight_at(it, ms, occ, geo, fs) for fs in LABEL_STEPS)
+
+
+def _place_straight_at(it: ItemState, ms: Measurer, occ: Occupancy, geo: Geo, fs: int) -> bool:
+    label_w = ms.width("hand", it.sprite.label, fs)
+    length = label_w * TEXT_LEN_SAFETY
+    arc_len = length * ARC_SLACK
+    k = int(math.ceil(arc_len / CONTOUR_STEP)) + 1
+    sx0, sy0, sx1, sy1 = geo.safe_rect
+    hx, hy = it.half_extent()
+    best = None
+    for above in (True, False):
+        base_y = (
+            it.cy - hy - BAND_DOWN * fs - STRAIGHT_GAP
+            if above
+            else it.cy + hy + BAND_UP * fs + STRAIGHT_GAP
+        )
+        for align in (0.0, -1.0, 1.0):  # 商品の中央・左寄せ・右寄せ
+            x0 = it.cx - arc_len / 2 + align * max(0.0, hx - arc_len / 2)
+            x0 = min(max(x0, sx0), max(sx0, sx1 - arc_len))
+            for tilt in STRAIGHT_TILTS:
+                d = np.array([math.cos(math.radians(tilt)), math.sin(math.radians(tilt))])
+                start = np.array([x0, base_y])
+                seg = start + np.arange(k)[:, None] * CONTOUR_STEP * d
+                seg = seg[np.linalg.norm(seg - start, axis=1) <= arc_len + 1e-6]
+                band = raster_band(seg, fs)
+                bad, cost = window_cost(band, occ, seg)
+                if best is None or cost < best[0]:
+                    best = (cost, bad, seg, band)
+    if best is None or best[1] > TOLERANCE_PX:
+        return False
+    cost, bad, seg, band = best
+    it.arc, it.fs, it.text_len, it.cost = seg, fs, length, cost
+    it.placed, it.straight = True, True
+    band.paint(occ.text)
+    return True
 
 
 def item_overlap_ratio(a: np.ndarray, b: np.ndarray) -> float:
@@ -1229,14 +1363,13 @@ def place_texts(
     ms: Measurer,
     rng: random.Random,
     steps: tuple[int, ...] = LABEL_STEPS,
+    straight: bool = True,
 ) -> tuple[bool, float]:
     """商品ごとに、輪郭の文字の区間を選ぶ。置けない商品は、少し動かして探し直す。"""
     size = (geo.w, geo.h)
     text = np.zeros((geo.h, geo.w), bool)
     for b in fixed.blocks:
         text |= b.mask(size)
-    for it in items:
-        it.contour = contour_local(it.sprite.alpha, round(it.h))[1]
     ok_all = True
     placed_masks: dict[int, np.ndarray] = {}
     order = sorted(range(len(items)), key=lambda i: -items[i].h)
@@ -1245,6 +1378,13 @@ def place_texts(
         occ.items |= it.mask(size)
     for i in order:
         it = items[i]
+        if straight and not contour_feasible(it, ms, size, steps):
+            # 形のうえで輪郭に沿わせられない（長いラベル・曲がりが急）。縮めても動かしても同じ
+            # すぐ商品の上か下にまっすぐ置く
+            if _place_straight(it, ms, occ, geo):
+                continue
+            ok_all = False
+            continue
         if _place_text(it, ms, occ, steps):
             continue
         # 動かして探し直す（近い所から）
@@ -1275,6 +1415,13 @@ def place_texts(
                 break
         if not done:
             it.cx, it.cy = orig
+            # 最後の手段（最後の試行だけ）: 輪郭に沿わせず、商品の上か下にまっすぐ置く
+            if straight:
+                occ.items = np.zeros_like(text)
+                for o in items:
+                    occ.items |= o.mask(size)
+                if _place_straight(it, ms, occ, geo):
+                    continue
             ok_all = False
     del placed_masks
     return ok_all, sum(it.cost for it in items if it.placed)
@@ -1441,6 +1588,7 @@ class Layout:
                     "light": None if it.sprite.light is None else round(it.sprite.light, 1),
                     "glow": it.glow,
                     "label_size": it.fs,
+                    "label_straight": it.straight,
                     "text_placed": it.placed,
                     "text_len": round(it.text_len, 1),
                     "text_cost": round(it.cost, 1),
@@ -1482,7 +1630,9 @@ def build_layout(brief: Brief, sprites: list[Sprite], fmt: str, seed: int, ms: M
             spread_vertically(items, fixed.region)
             relax(items, fixed.region)
         steps = LABEL_STEPS if attempt == ATTEMPTS else LABEL_STEPS[:1]
-        ok, cost = place_texts(items, fixed, geo, ms, rng, steps)
+        ok, cost = place_texts(
+            items, fixed, geo, ms, rng, steps, straight=attempt >= STRAIGHT_FROM_ATTEMPT
+        )
         unplaced = sum(1 for it in items if not it.placed)
         bg = PALETTES[brief.palette].bg
         for it in items:
@@ -1536,6 +1686,8 @@ class Checks:
     min_item_h: float = 0.0
     small_items: list[str] = field(default_factory=list)
     unplaced_text: list[str] = field(default_factory=list)
+    truncated_labels: list[str] = field(default_factory=list)  # 弧が文字より短く、末尾が描かれない
+    reversed_labels: list[str] = field(default_factory=list)  # 逆さに流れる区間が多い弧
     headline_lines: int = 0
     headline_fits: bool = True
     doodle_overlap_px: int = 0
@@ -1591,10 +1743,19 @@ def check_layout(lay: Layout, ms: Measurer | None = None) -> Checks:
         if it.arc is None:
             c.unplaced_text.append(it.sprite.id)
             continue
+        need = ms.width("hand", it.sprite.label, it.fs) * TEXT_LEN_SAFETY if ms else it.text_len
+        if arc_length(it.arc) < need - 1e-6:  # textPath は弧の終わりより先を描かない
+            c.truncated_labels.append(it.sprite.id)
+        if upside_fraction(it.arc) > UPSIDE_MAX:
+            c.reversed_labels.append(it.sprite.id)
         band = raster_band(it.arc[: max(2, int(it.text_len / CONTOUR_STEP) + 1)], it.fs)
         c.out_of_canvas_px += band.outside((0, 0, W, H))
         c.outside_safe_px += band.outside(geo.safe_rect)
         texts.append((f"label:{it.sprite.id}", band.full(W, H)))
+    if c.truncated_labels:
+        c.problems.append(f"ラベルが弧に収まらず末尾が欠ける（{', '.join(c.truncated_labels)}）")
+    if c.reversed_labels:
+        c.problems.append(f"ラベルが逆さに流れる（{', '.join(c.reversed_labels)}）")
     if c.unplaced_text:
         c.problems.append(f"輪郭の文字を置けない商品がある（{', '.join(c.unplaced_text)}）")
     for b in lay.blocks:

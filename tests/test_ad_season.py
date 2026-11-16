@@ -305,3 +305,120 @@ def test_render_html_has_stamp_glow_and_accent_layers(tmp_path):
     assert "NOVEMBER / 晩秋" in doc and 'class="stamp"' in doc
     assert doc.count("drop-shadow(0 0 ") == len(ac._GLOW_BLUR)  # 沈む1点だけ
     assert "weather" not in doc and "朝晩" not in doc  # weather_line は画像に入れない
+
+
+# ------------------------------------------------------------ palette_options を優先
+
+
+def test_options_are_the_only_candidates_and_ties_keep_order():
+    # 暗い服ばかり: 候補の中の cream が沈まない。候補に無い mustard・terracotta は使わない
+    winter = ["navy", "charcoal", "burgundy", "cream"]
+    used, reason = ap.choose_palette("navy", [10, 14, 8], winter)
+    assert used == "cream" and "cream" in reason
+    # 沈む数が同じなら並びの前のほう（ブリーフの palette でなくても）
+    used, _ = ap.choose_palette("burgundy", [92, 95], ["charcoal", "navy"])
+    assert used == "charcoal"
+    # 要求の色が最良ならそのまま
+    assert ap.choose_palette("charcoal", [92], ["charcoal", "navy"]) == ("charcoal", None)
+
+
+def test_options_never_pick_outside_even_when_all_sink():
+    used, _ = ap.choose_palette("navy", [15, 18], ["navy", "burgundy"])
+    assert used in ("navy", "burgundy")
+
+
+def test_without_options_old_behaviour():
+    assert ap.choose_palette("navy", [90, 85]) == ("navy", None)
+    assert ap.choose_palette("brown", [10, 14, 8])[0] != "brown"
+
+
+# ------------------------------------------------------------ 輪郭に沿う文字（欠け・食い込み）
+
+
+def _arc_steps(arc):
+    return np.linalg.norm(np.diff(arc, axis=0), axis=1)
+
+
+def test_window_ok_rejects_upside_down_and_sharp_turns():
+    ok = np.array([[x, 100.0] for x in range(0, 300, 6)])  # 左から右（上辺）
+    assert ac.window_ok(ok, 32, None)
+    assert not ac.window_ok(ok[::-1], 32, None)  # 右から左（下辺）は逆さ
+    t = np.linspace(0, 2 * np.pi * 1.2, 60)  # 1周以上の急な曲がり
+    loop = np.stack([100 + 30 * np.cos(t), 100 + 30 * np.sin(t)], axis=1)
+    assert not ac.window_ok(loop, 32, None)
+
+
+def test_window_ok_rejects_text_inside_own_item():
+    a = np.zeros((300, 300), np.uint8)
+    cv2.rectangle(a, (100, 100), (200, 200), 255, -1)
+    dist = ac.inside_distance(a > 40)
+    inside = np.array([[110.0 + k, 150.0] for k in range(0, 60, 6)])
+    outside = np.array([[110.0 + k, 60.0] for k in range(0, 60, 6)])
+    assert not ac.window_ok(inside, 32, dist)
+    assert ac.window_ok(outside, 32, dist)
+
+
+def test_offset_grows_with_font_size():
+    assert ac.offset_for(24) >= ac.CONTOUR_OFFSET
+    assert ac.offset_for(60) > ac.offset_for(32)
+
+
+def _layout(labels, seed=1, fmt="4:5"):
+    b = ac.parse_brief(raw(len(labels)))
+    sp = []
+    for k, lab in enumerate(labels):
+        a = np.zeros((420, 300), np.uint8)
+        cv2.ellipse(a, (150, 210), (140, 200), 0, 0, 360, 255, -1)
+        sp.append(ac.Sprite(f"s{k}", lab, Path(f"/x/{k}.png"), a))
+    return ac.build_layout(b, sp, fmt, seed, ac.Measurer(None))
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_labels_are_whole_forward_and_outside_their_item(seed):
+    lay = _layout(
+        ["ブランド の シャツ ¥6,800", "シャツ ¥14,800", "Field Master の シャツ ¥18,800"], seed
+    )
+    size = (lay.w, lay.h)
+    for it in lay.items:
+        assert it.placed and it.arc is not None
+        assert _arc_steps(it.arc).max() < 2 * ac.CONTOUR_STEP  # 途切れない1本の弧
+        assert ac.arc_length(it.arc) >= it.text_len - 1e-6  # 全文字が弧に収まる
+        assert ac.upside_fraction(it.arc) <= ac.UPSIDE_MAX  # 逆さに流れない
+        if not it.straight:
+            d, x0, y0 = ac.inside_distance(it.mask(size))
+            ix = np.clip(np.rint(it.arc[:, 0]).astype(int) - x0, 0, d.shape[1] - 1)
+            iy = np.clip(np.rint(it.arc[:, 1]).astype(int) - y0, 0, d.shape[0] - 1)
+            assert d[iy, ix].min() >= ac.BAND_DOWN * it.fs - 1  # 自分の商品に食い込まない
+    c = ac.check_layout(lay, ac.Measurer(None))
+    assert c.truncated_labels == [] and c.reversed_labels == []
+
+
+def test_label_too_long_for_any_contour_goes_straight_and_tilted_slightly():
+    ms = ac.Measurer(None)
+    geo = ac.geometry("4:5")
+    size = (geo.w, geo.h)
+    a = np.zeros((420, 300), np.uint8)
+    cv2.ellipse(a, (150, 210), (140, 200), 0, 0, 360, 255, -1)
+    label = "とても長い名前のブランドの古着のシャツで ¥18,800 のものです"
+    sp = ac.Sprite("s0", label, Path("/x/0.png"), a)
+    it = ac.ItemState(sp, 300.0, 540.0, 700.0, 4.0)
+    assert not ac.contour_feasible(it, ms, size, ac.LABEL_STEPS)  # 輪郭には載らない
+    occ = ac.Occupancy(size, geo.safe_rect, it.mask(size), np.zeros((geo.h, geo.w), bool))
+    assert ac._place_straight(it, ms, occ, geo)
+    assert it.placed and it.straight
+    v = it.arc[-1] - it.arc[0]
+    assert (
+        abs(np.degrees(np.arctan2(v[1], v[0]))) <= max(ac.STRAIGHT_TILTS) + 0.1
+    )  # 左から右へ・少し傾け
+    assert ac.arc_length(it.arc) >= it.text_len - 1e-6
+    band = ac.raster_band(it.arc, it.fs).full(*size)
+    assert np.count_nonzero(band & it.mask(size)) <= ac.TOLERANCE_PX  # 商品には重ならない
+
+
+def test_check_flags_truncated_label():
+    lay = _layout(["シャツ ¥1,000", "シャツ ¥2,000"], 2)
+    it = lay.items[0]
+    it.arc = it.arc[: max(3, len(it.arc) // 3)]  # 弧が文字より短い
+    c = ac.check_layout(lay, ac.Measurer(None))
+    assert it.sprite.id in c.truncated_labels
+    assert any("末尾が欠ける" in p for p in c.problems) and c.verdict == "fail"

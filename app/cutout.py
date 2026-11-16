@@ -438,6 +438,106 @@ def finish(image: Image.Image, mask: np.ndarray, box_score: float) -> Result:
     return Result(rgba, q, status, reasons)
 
 
+# ---------------------------------------------------------------- 人（着画）の切り抜き
+# 着画（人が着ている商品写真）の人ごとの切り抜き。服の判定（check / fail）とは別の道。
+# 検出は Grounding DINO、マスクは SAM2 に人の箱を渡し、縁は BiRefNet で仕上げる
+# しきい値は暫定（本番の商品写真 92 枚で見た値。出どころの無い値）
+PERSON_PROMPT = "person . face . hand"  # 2語だけだと顔が落ちる。hand は使わない
+PERSON_DET_THRESHOLD = 0.25
+PERSON_AREA_MIN = 0.06  # マスクが画像のこれ未満なら小さすぎる（fail）
+PERSON_BOX_FILL_MIN = 0.30  # マスクが人の箱に占める割合がこれ未満なら、人を捉えていない（fail）
+PERSON_BOX_SCORE_MIN = 0.50  # 人の箱の確信度がこれ未満は check
+PERSON_COMPONENT_MIN = 0.92  # 最大の連結成分がマスクのこれ未満なら、取り残しがある（check）
+PERSON_SAM_IOU_MIN = (
+    0.75  # SAM2 のマスクと BiRefNet の前景の重なりがこれ未満なら、縁が怪しい（check）
+)
+PERSON_RECT_FILL_MAX = (
+    0.93  # マスクが外接矩形に占める割合がこれ超なら、背景を取り残している（check）
+)
+
+
+@dataclass
+class PersonQuality:
+    area_ratio: float  # マスク ÷ 画像
+    box_fill: float  # マスク ÷ 人の箱
+    box_score: float
+    component_ratio: float  # 最大の連結成分 ÷ マスク
+    sam_iou: float  # SAM2 のマスクと仕上げた前景の重なり（IoU）
+    rect_fill: float  # マスク ÷ マスクの外接矩形
+
+
+def measure_person(solid: np.ndarray, sam_mask: np.ndarray, box: list[float], score: float):
+    """仕上げた前景（bool）から、人の切り抜きの品質の目安（モデルを使わない）。"""
+    total = float(solid.sum())
+    h, w = solid.shape
+    if total == 0:
+        return PersonQuality(0.0, 0.0, score, 0.0, 0.0, 0.0)
+    box_area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
+    count, _, areas = _components(solid)
+    ys, xs = np.where(solid)
+    rect = float((xs.max() - xs.min() + 1) * (ys.max() - ys.min() + 1))
+    union = float((solid | sam_mask).sum())
+    iou = float((solid & sam_mask).sum()) / union if union else 0.0
+    return PersonQuality(
+        area_ratio=round(total / (w * h), 4),
+        box_fill=round(min(1.0, total / box_area), 3),
+        box_score=round(score, 3),
+        component_ratio=round(float(areas.max()) / total if count else 0.0, 3),
+        sam_iou=round(iou, 3),
+        rect_fill=round(total / rect, 3),
+    )
+
+
+def grade_person(q: PersonQuality) -> tuple[str, list[str]]:
+    """人の切り抜きの判定。fail は使わない、check は人が見る、ok はそのまま使える。"""
+    fails, checks = [], []
+    if q.area_ratio < PERSON_AREA_MIN:
+        fails.append(f"人のマスクが小さすぎる（画像の {q.area_ratio:.1%}）")
+    if q.box_fill < PERSON_BOX_FILL_MIN:
+        fails.append(f"人の箱のうちマスクが {q.box_fill:.0%} しかない")
+    if q.box_score < PERSON_BOX_SCORE_MIN:
+        checks.append(f"人の箱の確信度が低い（{q.box_score:.2f}）")
+    if q.component_ratio < PERSON_COMPONENT_MIN:
+        checks.append(f"離れた取り残しがある（最大の塊 {q.component_ratio:.0%}）")
+    if q.sam_iou < PERSON_SAM_IOU_MIN:
+        checks.append(f"SAM2 と BiRefNet の縁が食い違う（IoU {q.sam_iou:.2f}）")
+    if q.rect_fill > PERSON_RECT_FILL_MAX:
+        checks.append(f"外接矩形をほぼ埋めている（{q.rect_fill:.0%}）。背景の取り残しの疑い")
+    if fails:
+        return "fail", fails + checks
+    return ("check", checks) if checks else ("ok", [])
+
+
+def finish_person(
+    image: Image.Image, sam_mask: np.ndarray, fg: np.ndarray, box: list[float], box_score: float
+) -> Result:
+    """人の切り抜きの仕上げ・判定・RGBA（モデルを使わない部分）。画素は描き直さない（アルファだけ）。
+    SAM2 のマスクで人のまとまりを決め、縁の細かさ（髪・手・足元）を BiRefNet のアルファで採る。"""
+    sam = clean_mask(sam_mask)
+    alpha = refine_alpha(sam, fg)
+    solid = clean_mask(alpha > BIREFNET_SOLID)
+    keep = cv2.dilate(solid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    alpha = np.where(keep, alpha, 0.0)
+    q = measure_person(solid, sam, box, box_score)
+    status, reasons = grade_person(q)
+    if status == "fail":
+        return Result(None, q, status, reasons, method="person")
+    a8 = np.round(alpha * 255).astype(np.uint8)
+    return Result(crop_to_content(to_rgba(image, a8)), q, status, reasons, method="person")
+
+
+def parse_people(labels: list[str], scores: list[float], boxes: list[list[float]]) -> list[dict]:
+    """DINO の出力を {kind: person / face, score, box} にそろえる。"person face" のように
+    語が混ざった物は、どちらか分からないので捨てる。"""
+    out = []
+    for lab, sc, bx in zip(labels, scores, boxes, strict=False):
+        lab = (lab or "").strip().lower()
+        kind = lab if lab in ("person", "face") else None
+        if kind:
+            out.append({"kind": kind, "score": float(sc), "box": [float(v) for v in bx]})
+    return out
+
+
 # ---------------------------------------------------------------- モデル
 
 
@@ -560,6 +660,40 @@ class Cutter:
         boxes = res["boxes"].cpu().tolist()
         scores = res["scores"].cpu().tolist()
         return pick_box(boxes, scores, image.size)
+
+    def detect_people(self, image: Image.Image) -> list[dict]:
+        """人と顔の検出（{kind, score, box} の一覧。画像の座標）。"""
+        inputs = self.dino_proc(images=image, text=PERSON_PROMPT, return_tensors="pt").to(
+            self.device
+        )
+        with self.torch.no_grad():
+            out = self.dino(**inputs)
+        res = self.dino_proc.post_process_grounded_object_detection(
+            out,
+            inputs["input_ids"],
+            threshold=PERSON_DET_THRESHOLD,
+            text_threshold=TEXT_THRESHOLD,
+            target_sizes=[image.size[::-1]],
+        )[0]
+        labels = res.get("text_labels") or res.get("labels") or []
+        return parse_people(list(labels), res["scores"].cpu().tolist(), res["boxes"].cpu().tolist())
+
+    def cut_person(self, image: Image.Image, box: list[float], score: float) -> Result:
+        """人ごと切り抜く（服の判定とは別の道）。SAM2 に人の箱を渡し、BiRefNet で縁を仕上げる。
+        BiRefNet が読めなければ SAM2 だけ（縁は粗くなる）。"""
+        import time
+
+        t0 = time.time()
+        image = image.convert("RGB")
+        mask = self.segment(image, box)
+        if self.load_birefnet():
+            result = finish_person(image, mask, self.foreground(image, box), box, score)
+        else:
+            fg = clean_mask(mask).astype(np.float32)
+            result = finish_person(image, mask, fg, box, score)
+            result.reasons.append("BiRefNet が読めず SAM2 だけで切り抜いた")
+        result.seconds = time.time() - t0
+        return result
 
     def segment(self, image: Image.Image, box: list[float]) -> np.ndarray:
         inputs = self.sam_proc(

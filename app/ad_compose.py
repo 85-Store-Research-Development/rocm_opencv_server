@@ -1730,6 +1730,7 @@ def compose_format(
                         "seed": c.seed,
                         "verdict": c.checks.verdict,
                         "score": c.checks.score,
+                        "critique": c.critique,
                         "problems": c.checks.problems,
                     }
                     for c in cands

@@ -56,6 +56,7 @@ HEADLINE_STEPS = {
     "9:16": (SCALE[5], SCALE[4], SCALE[3]),
 }
 LABEL_STEPS = (SCALE[1], SCALE[0])  # 輪郭に沿う文字（大きいほうから試す）
+# 下限は LABEL_STEPS[0]。入らないときは商品を縮めて間隔を広げ、最後の試行だけ小さい段も許す
 HEAD_LINE_HEIGHT = 1.16
 HEADLINE_MAX_LINES = 2
 HEADLINE_LINE_MAX = 16  # 見出しの1行の字数の上限
@@ -72,6 +73,7 @@ ITEM_EDGE_RATIO = 0.03  # 商品が画面の端から離れる最小（幅に対
 ANGLE_MAX = 10.0
 ANGLE_MIN = 3.0
 FILL_RATIO = 0.64  # 商品の外接矩形の合計が、置ける範囲に占める割合のめやす
+FILL_RATIO_TALL = 0.88  # 縦長（9:16）は商品を大きめにして縦に広く使う
 MAX_ITEM_H_OF_REGION = 0.6
 MAX_ITEM_W_OF_REGION = 0.65
 ELLIPSE_FACTOR = 0.85  # 商品どうしの離し方に使う楕円の大きさ（外接矩形に対して）
@@ -202,9 +204,34 @@ class Brief:
     items: list[BriefItem]
     seed: int = 0
     candidates: int = 8
+    orig_id: str = (
+        ""  # 元の id（CRM の URL・返信・dropped_items に使う）。id はファイル名用の安全な形
+    )
+    revision: object = None  # CRM が古い版を見分けるための版（そのまま返す）
+    formats: list[str] = field(default_factory=list)  # ブリーフが望む形式（引数が無いとき使う）
 
 
 _ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def safe_id(raw_id: str, maxlen: int = 48) -> str:
+    """ファイル名・キャッシュに使える形に直す（英数字と . _ - 以外は _）。直した・切ったときは、
+    別の id と衝突しないよう元の id の短いハッシュを足す。"""
+    safe = _UNSAFE.sub("_", raw_id)[:maxlen]
+    if safe != raw_id or safe in ("", ".", ".."):
+        safe = f"{safe}-{hashlib.sha1(raw_id.encode()).hexdigest()[:6]}"
+    return safe
+
+
+def _raw_id(value) -> str | None:
+    """id は文字列か整数（CRM のブリーフは整数）。それ以外・空は None。"""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    return text if text and len(text) <= 200 and not _CTRL.search(text) else None
+
+
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
@@ -228,9 +255,9 @@ def parse_brief(raw: dict) -> Brief:
     problems: list[str] = []
     if not isinstance(raw, dict):
         raise BriefError(["ブリーフは JSON のオブジェクトにしてください"])
-    bid = raw.get("id")
-    if not isinstance(bid, str) or not _ID.match(bid):
-        problems.append("id は英数字と . _ - の 1〜64 字にしてください")
+    bid = _raw_id(raw.get("id"))
+    if bid is None:
+        problems.append("id は空でない文字列か整数にしてください")
     fmt = raw.get("format") or DEFAULT_FORMAT
     if fmt not in FORMATS:
         problems.append(f"format は {' / '.join(FORMATS)} のどれかにしてください")
@@ -274,9 +301,9 @@ def parse_brief(raw: dict) -> Brief:
         if not isinstance(it, dict):
             problems.append(f"items[{i}] はオブジェクトにしてください")
             continue
-        iid = it.get("id")
-        if not isinstance(iid, str) or not _ID.match(iid):
-            problems.append(f"items[{i}].id は英数字と . _ - の 1〜64 字にしてください")
+        iid = _raw_id(it.get("id"))
+        if iid is None:
+            problems.append(f"items[{i}].id は空でない文字列か整数にしてください")
             continue
         if iid in seen:
             problems.append(f"items[{i}].id が重複しています（{iid}）")
@@ -292,7 +319,24 @@ def parse_brief(raw: dict) -> Brief:
         )
     if problems:
         raise BriefError(problems)
-    return Brief(bid, fmt, name, tagline, area, lines, aside, palette, items, seed, cands)
+    wanted = raw.get("formats")
+    formats = [f for f in wanted if f in FORMATS] if isinstance(wanted, list) else []
+    return Brief(
+        safe_id(bid),
+        fmt,
+        name,
+        tagline,
+        area,
+        lines,
+        aside,
+        palette,
+        items,
+        seed,
+        cands,
+        orig_id=bid,
+        revision=raw.get("revision"),
+        formats=formats,
+    )
 
 
 # ---------------------------------------------------------------- 幾何（占有マップの部品）
@@ -868,7 +912,14 @@ def prepare_sprites(
             meta = json.loads(meta_path.read_text())
         else:
             if data is None:
-                data = fetch(src)
+                try:
+                    data = fetch(src)
+                    Image.open(io.BytesIO(data)).verify()
+                except Exception as e:  # 取れない・画像でない商品は外して続ける
+                    reason = f"画像を取得できなかった（{type(e).__name__}）"
+                    dropped.append({"id": item.id, "status": "fail", "reasons": [reason]})
+                    log(f"  画像 {item.id}: {reason}")
+                    continue
             if cutter is None:
                 cutter = (cutter_factory or _default_cutter)()
             image = Image.open(io.BytesIO(data)).convert("RGB")
@@ -970,7 +1021,8 @@ def make_items(
     if n >= 3:
         mult[rng.randrange(n)] *= 1.3  # 主役を1つ
     aspects = [s.alpha.shape[1] / s.alpha.shape[0] for s in sprites]
-    k = FILL_RATIO * rw * rh * scale * scale / sum(m * m for m in mult)
+    fill = FILL_RATIO_TALL if rh > 1.15 * rw else FILL_RATIO
+    k = fill * rw * rh * scale * scale / sum(m * m for m in mult)
     items = []
     centers = initial_centers(rng, n, region)
     for i, sp in enumerate(sprites):
@@ -1060,9 +1112,11 @@ def best_window(
     return best
 
 
-def _place_text(it: ItemState, ms: Measurer, occ: Occupancy) -> bool:
+def _place_text(
+    it: ItemState, ms: Measurer, occ: Occupancy, steps: tuple[int, ...] = LABEL_STEPS
+) -> bool:
     """商品 it の文字の区間を選んで占有マップに書く。許容内に収まれば True。"""
-    for fs in LABEL_STEPS:
+    for fs in steps:
         label_w = ms.width("hand", it.sprite.label, fs)
         best = best_window(it, label_w, fs, occ)
         if best is None:
@@ -1088,7 +1142,12 @@ def item_overlap_ratio(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def place_texts(
-    items: list[ItemState], fixed: Fixed, geo: Geo, ms: Measurer, rng: random.Random
+    items: list[ItemState],
+    fixed: Fixed,
+    geo: Geo,
+    ms: Measurer,
+    rng: random.Random,
+    steps: tuple[int, ...] = LABEL_STEPS,
 ) -> tuple[bool, float]:
     """商品ごとに、輪郭の文字の区間を選ぶ。置けない商品は、少し動かして探し直す。"""
     size = (geo.w, geo.h)
@@ -1105,7 +1164,7 @@ def place_texts(
         occ.items |= it.mask(size)
     for i in order:
         it = items[i]
-        if _place_text(it, ms, occ):
+        if _place_text(it, ms, occ, steps):
             continue
         # 動かして探し直す（近い所から）
         done = False
@@ -1127,7 +1186,7 @@ def place_texts(
                 occ2.items |= mine
                 if np.count_nonzero(mine & occ.text) > TOLERANCE_PX:
                     continue
-                if _place_text(it, ms, occ2):
+                if _place_text(it, ms, occ2, steps):
                     occ.items = occ2.items
                     done = True
                     break
@@ -1291,7 +1350,8 @@ def build_layout(brief: Brief, sprites: list[Sprite], fmt: str, seed: int, ms: M
         rng = random.Random(f"{seed}:{attempt}")
         items = make_items(sprites, fixed.region, rng, scale)
         relax(items, fixed.region)
-        ok, cost = place_texts(items, fixed, geo, ms, rng)
+        steps = LABEL_STEPS if attempt == ATTEMPTS else LABEL_STEPS[:1]
+        ok, cost = place_texts(items, fixed, geo, ms, rng, steps)
         unplaced = sum(1 for it in items if not it.placed)
         lay = Layout(
             fmt,
@@ -1659,10 +1719,13 @@ class FormatResult:
     layout_json: Path
     seconds: float
     reasons: list[str]
+    revision: object = None
 
     def meta(self) -> dict:
-        """CRM へ返す meta（format・seed・score・verdict・checks・dropped_items）。"""
+        """CRM へ返す meta（format・seed・score・verdict・checks・dropped_items・revision）。"""
+        extra = {} if self.revision is None else {"revision": self.revision}
         return {
+            **extra,
             "format": self.format,
             "seed": self.best.seed,
             "score": self.best.checks.score,
@@ -1719,7 +1782,7 @@ def compose_format(
         json.dumps(
             {
                 **best.layout.to_json(),
-                "brief_id": brief.id,
+                "brief_id": brief.orig_id or brief.id,
                 "verdict": verdict,
                 "reasons": reasons,
                 "checks": asdict(best.checks),
@@ -1741,7 +1804,16 @@ def compose_format(
         )
     )
     return FormatResult(
-        fmt, verdict, best, cands, dropped, png, layout_json, time.time() - t0, reasons
+        fmt,
+        verdict,
+        best,
+        cands,
+        dropped,
+        png,
+        layout_json,
+        time.time() - t0,
+        reasons,
+        revision=brief.revision,
     )
 
 
@@ -1776,7 +1848,7 @@ def index_html(results: list[tuple[Brief, list[FormatResult]]]) -> str:
         "</style>"
     ]
     for brief, fresults in results:
-        out.append(f"<section><h2>{e(brief.id)}</h2>")
+        out.append(f"<section><h2>{e(brief.orig_id or brief.id)}</h2>")
         for fr in fresults:
             out.append(
                 f"<h3>{e(fr.format)} — <span class='{fr.verdict[:4]}'>{e(fr.verdict)}</span> "
@@ -1836,8 +1908,8 @@ def compose_brief(
             log=log,
         )
         log(
-            f"  {brief.id} {fmt}: {fr.verdict} 点{fr.best.checks.score} {fr.seconds:.1f}秒"
-            + (f" {'; '.join(fr.reasons)}" if fr.reasons else "")
+            f"  {brief.orig_id or brief.id} {fmt}: {fr.verdict} 点{fr.best.checks.score}"
+            f" {fr.seconds:.1f}秒" + (f" {'; '.join(fr.reasons)}" if fr.reasons else "")
         )
         results.append(fr)
     return results

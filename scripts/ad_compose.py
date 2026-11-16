@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx2 as httpx
 
@@ -40,11 +41,12 @@ def fetch_pending_briefs(base: str, client: httpx.Client | None = None) -> list[
 def post_creative(
     base: str, brief_id: str, png: Path, meta: dict, client: httpx.Client | None = None
 ) -> dict:
-    """POST <base>/api/ads/briefs/<id>/creatives（multipart: image と meta（JSON 文字列））。"""
+    """POST <base>/api/ads/briefs/<元の id>/creatives（multipart: image と meta の JSON）。"""
     c = client or httpx.Client(timeout=120)
+    url = f"{base.rstrip('/')}/api/ads/briefs/{quote(str(brief_id), safe='')}/creatives"
     with png.open("rb") as f:
         r = c.post(
-            f"{base.rstrip('/')}/api/ads/briefs/{brief_id}/creatives",
+            url,
             files={"image": (png.name, f, "image/png")},
             data={"meta": json.dumps(meta, ensure_ascii=False)},
         )
@@ -70,13 +72,16 @@ def run_briefs(
     crm_base=None,
     client=None,
     **kw,
-):
-    results = []
+) -> tuple[list, list[dict]]:
+    """ブリーフごとに作って返す。1つが失敗しても止めず、(結果, 失敗の一覧) を返す。"""
+    results, failures = [], []
     for raw in raw_briefs:
-        brief = ac.parse_brief(raw)
-        fmts = formats or [brief.format]
-        print(f"{brief.id}: {', '.join(fmts)}", flush=True)
+        raw_id = raw.get("id") if isinstance(raw, dict) else None
         try:
+            brief = ac.parse_brief(raw)
+            raw_id = brief.orig_id
+            fmts = formats or brief.formats or [brief.format]
+            print(f"{raw_id}: {', '.join(fmts)}", flush=True)
             frs = ac.compose_brief(
                 brief,
                 fmts,
@@ -88,14 +93,16 @@ def run_briefs(
                 base_dir=base_dir,
                 **kw,
             )
-        except ac.CannotCompose as e:
-            print(f"  作れない: {e}", flush=True)
-            continue
-        results.append((brief, frs))
-        if crm_base:
-            for fr in frs:
-                post_creative(crm_base, brief.id, fr.png, meta_for_post(fr), client)
-    return results
+            if crm_base:
+                for fr in frs:
+                    post_creative(crm_base, brief.orig_id, fr.png, meta_for_post(fr), client)
+            results.append((brief, frs))
+        except Exception as e:  # 1件の失敗で全体を止めない
+            reason = "; ".join(e.problems) if isinstance(e, ac.BriefError) else f"{e}"
+            reason = f"{type(e).__name__}: {reason}"[:400]
+            print(f"  失敗 {raw_id}: {reason}", flush=True)
+            failures.append({"id": None if raw_id is None else str(raw_id), "reason": reason})
+    return results, failures
 
 
 def main() -> None:
@@ -132,7 +139,7 @@ def main() -> None:
 
         critic = load_critic()
     t0 = time.time()
-    results = run_briefs(
+    results, failures = run_briefs(
         raws,
         formats,
         args.out,
@@ -143,9 +150,15 @@ def main() -> None:
         crm_base=args.crm_base,
         render_top=args.render_top,
     )
+    args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "index.html").write_text(ac.index_html(results))
     n = sum(len(f) for _, f in results)
     print(f"{n} 枚 / {time.time() - t0:.1f} 秒 → {(args.out / 'index.html').resolve()}")
+    if failures:
+        print(f"失敗 {len(failures)} 件:")
+        for f in failures:
+            print(f"  - {f['id']}: {f['reason']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

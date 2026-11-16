@@ -92,7 +92,8 @@ def test_parse_brief_ok_and_defaults():
         ({"palette": "pink"}, "palette"),
         ({"format": "3:2"}, "format"),
         ({"items": []}, "items"),
-        ({"id": "../x"}, "id"),
+        ({"id": ""}, "id"),
+        ({"id": True}, "id"),
         ({"candidates": 0}, "candidates"),
         ({"store": {"tagline": "x"}}, "store.name"),
     ],
@@ -598,3 +599,97 @@ def test_meta_for_post_is_plain_json():
     assert set(meta) == {"format", "seed", "score", "verdict", "checks", "dropped_items"}
     assert meta["seed"] == 7
     json.dumps(meta)
+
+
+# ------------------------------------------------------------ CRM のブリーフ（整数の id など）
+
+
+def test_parse_brief_accepts_crm_shape_and_keeps_original_ids():
+    raw = brief_raw(
+        2, id=3, revision=4, status="pending", copy={"x": 1}, landing_url="u", iso_week="w"
+    )
+    raw["items"][0]["id"] = "gid://shopify/Product/8343959535731"
+    raw["items"][0]["title"] = "extra"
+    raw["formats"] = ["9:16", "bad"]
+    b = ac.parse_brief(raw)
+    assert b.orig_id == "3" and b.id == "3" and b.revision == 4 and b.formats == ["9:16"]
+    assert b.items[0].id == "gid://shopify/Product/8343959535731"
+
+
+def test_safe_id_is_filename_safe_and_collision_free():
+    assert ac.safe_id("abc-1.2_x") == "abc-1.2_x"
+    a, b = ac.safe_id("a/b"), ac.safe_id("a?b")
+    assert a != b and all(c.isalnum() or c in "._-" for c in a + b)
+    assert ac.safe_id("../x").startswith(".._x-") and ac.safe_id("..") != ".."
+    assert len(ac.safe_id("x" * 300)) <= 48 + 7
+    assert ac.parse_brief(brief_raw(id="../x")).id == ac.safe_id("../x")
+
+
+def test_fetch_failure_drops_only_that_item(tmp_path):
+    raw = brief_raw(3)
+    for k, it in enumerate(raw["items"]):
+        it["image"] = f"https://example.invalid/{k}.jpg"
+    src = tmp_path / "ok.jpg"
+    Image.new("RGB", (40, 40), (9, 9, 9)).save(src)
+
+    def fetch(url):
+        if url.endswith("/1.jpg"):
+            raise OSError("boom")
+        return src.read_bytes()
+
+    sp, dropped = ac.prepare_sprites(
+        ac.parse_brief(raw),
+        tmp_path / "c",
+        fetch=fetch,
+        cutter_factory=lambda: FakeCutter(["ok", "ok"]),
+        log=lambda *_: None,
+    )
+    assert (
+        len(sp) == 2 and dropped[0]["id"] == "i2" and "取得できなかった" in dropped[0]["reasons"][0]
+    )
+
+
+def test_meta_has_revision_only_when_given():
+    lay = ac.build_layout(ac.parse_brief(brief_raw(2)), sprites(2), "4:5", 0, ac.Measurer(None))
+    c = ac.Candidate(1, lay, ac.check_layout(lay))
+    fr = ac.FormatResult("4:5", "pass", c, [c], [], Path("a"), Path("b"), 1.0, [], revision=7)
+    assert script.meta_for_post(fr)["revision"] == 7
+    fr.revision = None
+    assert "revision" not in script.meta_for_post(fr)
+
+
+def test_post_creative_uses_original_id_in_url(crm, tmp_path):
+    png = tmp_path / "x.png"
+    Image.new("RGB", (4, 4)).save(png)
+    script.post_creative(crm, "a/b 3", png, {"format": "4:5"})
+    assert FakeCrm.received[0][1] == "/api/ads/briefs/a%2Fb%203/creatives"
+
+
+def test_run_briefs_continues_after_a_failure(tmp_path, monkeypatch, crm):
+    good = brief_raw(2, id=11, revision=2)
+    bad_validation = brief_raw(2, id=12, palette="pink")
+    too_few = brief_raw(2, id=13)
+    calls = []
+
+    def fake_compose(brief, fmts, out, fonts, cache, **kw):
+        if brief.orig_id == "13":
+            raise ac.CannotCompose("切り抜けた商品が1点")
+        png = tmp_path / f"{brief.id}.png"
+        Image.new("RGB", (4, 4)).save(png)
+        lay = ac.build_layout(brief, sprites(2), "4:5", 0, ac.Measurer(None))
+        c = ac.Candidate(0, lay, ac.check_layout(lay))
+        calls.append(brief.orig_id)
+        return [
+            ac.FormatResult("4:5", "pass", c, [c], [], png, png, 1.0, [], revision=brief.revision)
+        ]
+
+    monkeypatch.setattr(ac, "compose_brief", fake_compose)
+    results, failures = script.run_briefs(
+        [bad_validation, too_few, good, "not a dict"], ["4:5"], tmp_path, tmp_path, crm_base=crm
+    )
+    assert calls == ["11"] and len(results) == 1
+    assert [f["id"] for f in failures] == ["12", "13", None]
+    assert "palette" in failures[0]["reason"] and "切り抜けた" in failures[1]["reason"]
+    posts = [r for r in FakeCrm.received if r[0] == "POST"]
+    assert [p[1] for p in posts] == ["/api/ads/briefs/11/creatives"]
+    assert posts[0][2]["meta"]["revision"] == 2

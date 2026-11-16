@@ -271,6 +271,16 @@ uv run --group clip --group clef-local python -m scripts.ad_compose \
   なら2つは置けた。通らなければ `needs_review`。`meta` に `layout: "single"`・`callouts_wanted` / `callouts_placed` /
   `callouts_placed_kinds` / `callouts_dropped`（省いたメモ `{kind, text, reason}`）・`worn_used`・`detail_photos_used`・
   `price_badge` / `stamp_placed` を入れる（従来の形の `meta` には増えない）
+- 着画が優先（複数点の組み）: 着画つきで検査に通らないとき、着画を諦める前に、商品を**ブリーフの並びの後ろから1点ずつ**
+  減らしてやり直す（着画の商品は外さない。下限は着画の商品 + ほか2点）。形式ごとの目安は 4:5 が4点・1:1 が3点・9:16 が3点まで
+  （着画の商品を含む。`WORN_MAX_ITEMS`。試して、これより多いと文字と商品が小さくなる）。外した商品は `dropped_items` に
+  `{id, status: "omitted", reasons: ["着画を入れるため"]}` で残る。どの点数でも通らないときだけ、着画なしの全点に戻す
+  （`worn_fallback` に理由）。着画なしは、ブリーフの点数をなるべく保ち、検査に通らないときだけ後ろから減らす
+  （それでも通らなければ全点のまま `needs_review`）。点数を減らす試しは、まず4候補で1つも通らなければ次へ進む
+- 長いラベル: 輪郭に入らない「<ブランド> の <品名> ¥<価格>」は、文字を小さくしたり商品の上下にまっすぐ置いたりする前に、
+  ブランドの部分を外した「<品名> ¥<価格>」にする（その形のときだけ。価格は必ず残す）。短くしたラベルは `meta.labels_shortened`
+  （`{id, from, to}`。無ければキー自体を付けない）と `layout.json` の `label_full` に残る
+- 着画からの点線の矢印は、ほかの商品・文字から 20px 以内を通らない（通るなら引かない）。長さは画面の幅の 40% まで
 - 季節感（任意）: ブリーフの `season`（`{motif, label, stamp, weather_line, stage, tmax, tmin, trend, estimated}`）を
   読む。`motif` は `early_spring` / `spring` / `early_summer` / `summer` / `late_summer` / `autumn` / `late_autumn` /
   `winter` / `midwinter`。無い・知らない値なら季節なし（従来の見た目）。motif ごとに 6 種類以上の手描きの落書き

@@ -119,7 +119,15 @@ WORN_W_MAX_OF_REGION = 0.42  # 幅も同じく
 WORN_ANGLE = (1.0, 4.0)  # 傾き（±度）。小さめ
 WORN_GAP = 26  # 着画とほかの商品の領域の間
 WORN_LINK_GAP = 16  # 点線の矢印と商品の間
-WORN_LINK_MAX = 0.55  # 点線の矢印の長さの上限（画面の幅に対する割合）
+WORN_LINK_MAX = 0.40  # 点線の矢印の長さの上限（画面の幅に対する割合）
+WORN_LINK_CLEAR = (
+    20  # 点線の矢印が、ほかの商品・文字から空ける距離（px）。これ以内を通るなら引かない
+)
+# 着画つきで気持ちよく入る商品の点数の目安（形式ごと。着画の商品を含む）。超えるぶんは後ろから外す
+WORN_MAX_ITEMS = {"4:5": 4, "1:1": 3, "9:16": 3}
+PROBE_CANDIDATES = 4  # 点数を減らして試すとき、まずこの数で1つも通らなければ次の点数へ
+WORN_MIN_OTHERS = 2  # 着画の商品のアイテム写真のほかに、最低これだけは残す
+SHORT_LABEL = re.compile(r"^(?P<brand>.+?) の (?P<rest>.+ ¥\d[\d,]*)$")
 WORN_LINK_THICK = 18  # 点線の矢印が空いていなければならない太さ（px）
 STRAIGHT_FROM_ATTEMPT = 3  # 商品を縮めてもだめなら、この試行から先は商品の上下にまっすぐ置いてよい
 STRAIGHT_GAP = 14  # 輪郭に沿わせられないとき、商品の上下にまっすぐ置く文字との間
@@ -1097,6 +1105,7 @@ class ItemState:
     straight: bool = False  # 輪郭に沿わせられず、商品の上か下にまっすぐ置いた文字
     contours: dict = field(default_factory=dict)  # 文字の大きさごとの輪郭（商品の座標）
     glow: bool = False  # 地に沈むので、縁にやわらかい光の縁取りを足す（画素は変えない）
+    label_full: str = ""  # ラベルを短くしたとき、元のラベル（短くしていなければ空）
 
     def __post_init__(self):
         self.w = self.sprite.alpha.shape[1] * self.h / self.sprite.alpha.shape[0]
@@ -1396,6 +1405,23 @@ def item_overlap_ratio(a: np.ndarray, b: np.ndarray) -> float:
     return inter / small if small else 0.0
 
 
+def shorten_label(label: str) -> str | None:
+    """「<ブランド> の <品名> ¥<価格>」の形のときだけ、ブランドの部分を外した「<品名> ¥<価格>」。
+    価格は必ず残す。その形でなければ None。"""
+    m = SHORT_LABEL.match(label)
+    return m.group("rest") if m else None
+
+
+def _shorten(it: ItemState) -> bool:
+    """輪郭に入らないラベルを短くする（文字を小さくするより先に）。短くできたら True。"""
+    short = None if it.sprite.worn or it.label_full else shorten_label(it.sprite.label)
+    if not short:
+        return False
+    it.label_full = it.sprite.label
+    it.sprite = replace(it.sprite, label=short)
+    return True
+
+
 def place_texts(
     items: list[ItemState],
     fixed: Fixed,
@@ -1422,13 +1448,16 @@ def place_texts(
             it.placed = True
             continue
         if straight and not contour_feasible(it, ms, size, steps):
-            # 形のうえで輪郭に沿わせられない（長いラベル・曲がりが急）。縮めても動かしても同じ
-            # すぐ商品の上か下にまっすぐ置く
-            if _place_straight(it, ms, occ, geo):
+            # 形のうえで輪郭に沿わせられない（長いラベル・曲がりが急）。まずラベルを短くして
+            # 沿わせられるか見る。だめなら（縮めても動かしても同じなので）商品の上か下にまっすぐ置く
+            if not (_shorten(it) and contour_feasible(it, ms, size, steps)):
+                if _place_straight(it, ms, occ, geo):
+                    continue
+                ok_all = False
                 continue
-            ok_all = False
-            continue
         if _place_text(it, ms, occ, steps):
+            continue
+        if _shorten(it) and _place_text(it, ms, occ, steps):  # 入らなければ、小さくする前に短く
             continue
         # 動かして探し直す（近い所から。着画は据えた場所から動かさない）
         done = False
@@ -1643,6 +1672,7 @@ class Layout:
                     "light": None if it.sprite.light is None else round(it.sprite.light, 1),
                     "glow": it.glow,
                     "worn": it.sprite.worn,
+                    "label_full": it.label_full or None,
                     "label_size": it.fs,
                     "label_straight": it.straight,
                     "text_placed": it.placed,
@@ -1740,7 +1770,13 @@ def plan_link(
     wp, tp = push(wp, wc, WORN_LINK_GAP), push(tp, tc, WORN_LINK_GAP)
     k = 2 * (WORN_LINK_THICK // 2) + 1
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    blocked = cv2.dilate(taken.astype(np.uint8), kern) > 0
+    kc = (
+        2 * (WORN_LINK_CLEAR + WORN_LINK_THICK // 2) + 1
+    )  # ほかの物から空ける距離（線の太さの半分も足す）
+    blocked = (
+        cv2.dilate(taken.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kc, kc)))
+        > 0
+    )
     own = cv2.dilate((wm | tm).astype(np.uint8), kern) > 0
     # 着画・アイテム写真の縁のすぐ外までは通ってよい（始点・終点は縁から GAP だけ離してある）
     own_core = cv2.erode((wm | tm).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
@@ -2508,9 +2544,15 @@ class FormatResult:
         extra = {} if self.revision is None else {"revision": self.revision}
         lay = self.best.layout
         single = {} if lay.single is None else single_meta(lay)
+        short = [
+            {"id": it.sprite.id, "from": it.label_full, "to": it.sprite.label}
+            for it in lay.items
+            if it.label_full
+        ]
         return {
             **extra,
             **single,
+            **({"labels_shortened": short} if short else {}),
             "format": self.format,
             "palette_used": lay.palette,
             "palette_changed_reason": lay.palette_changed_reason,
@@ -2546,6 +2588,20 @@ def fmt_slug(fmt: str) -> str:
     return fmt.replace(":", "x")
 
 
+def reduce_items(
+    sprites: list[Sprite], n: int, keep_id: str | None
+) -> tuple[list[Sprite], list[Sprite]]:
+    """商品を n 点まで、ブリーフの並びの後ろから外す（keep_id の商品は外さない）。(残り, 外した)"""
+    keep = list(sprites)
+    removed: list[Sprite] = []
+    for i in range(len(keep) - 1, -1, -1):
+        if len(keep) <= n:
+            break
+        if keep[i].id != keep_id:
+            removed.append(keep.pop(i))
+    return keep, removed[::-1]
+
+
 def compose_format(
     brief: Brief,
     sprites: list[Sprite],
@@ -2574,31 +2630,75 @@ def compose_format(
         brief = replace(
             brief, palette=used, palette_requested=brief.palette, palette_changed_reason=reason
         )
-    cands: list[Candidate] = []
     fallback = None
     single = brief.layout == ad_single.LAYOUT_NAME
+    omitted: list[dict] = []  # 入りきらなくて外した商品（dropped_items に足す）
 
-    def build(k: int, with_worn: Sprite | None) -> Layout:
+    def build(k: int, subset: list[Sprite], with_worn: Sprite | None) -> Layout:
         if single:  # 1点もの。着画が無い（外した）ときだけ細部の写真を添える
             return build_single_layout(
-                brief, sprites, fmt, brief.seed + k, ms, with_worn, None if with_worn else details
+                brief, subset, fmt, brief.seed + k, ms, with_worn, None if with_worn else details
             )
-        return build_layout(brief, sprites, fmt, brief.seed + k, ms, with_worn)
+        return build_layout(brief, subset, fmt, brief.seed + k, ms, with_worn)
 
+    def run(subset: list[Sprite], with_worn: Sprite | None) -> list[Candidate]:
+        """この商品の並びで候補を作って並べる。先に PROBE_CANDIDATES 個で通る物が無ければ止める。"""
+        out: list[Candidate] = []
+        for k in range(brief.candidates):
+            lay = build(k, subset, with_worn)
+            out.append(Candidate(brief.seed + k, lay, check_layout(lay, ms)))
+            if (
+                k + 1 == PROBE_CANDIDATES
+                and not single
+                and not any(c.checks.verdict == "pass" for c in out)
+            ):
+                break
+        out.sort(key=Candidate.sort_key)
+        return out
+
+    def omit(removed: list[Sprite], why: str) -> list[dict]:
+        return [{"id": sp.id, "status": "omitted", "reasons": [why]} for sp in removed]
+
+    cands: list[Candidate] = []
     if worn is not None:
-        for k in range(brief.candidates):
-            lay = build(k, worn)
-            cands.append(Candidate(brief.seed + k, lay, check_layout(lay, ms)))
-        cands.sort(key=Candidate.sort_key)
-        if cands[0].checks.verdict != "pass":
-            # 着画は「あれば」なので、無理に入れて崩さない。検査に通らなければ着画なしの組みに戻す
-            fallback = "着画を入れると検査に通らなかった: " + "; ".join(cands[0].checks.problems)
-            log(f"  着画なしに戻す: {fallback}")
+        # 着画が優先: 入らないときは、着画を諦める前に商品を後ろから1点ずつ減らす
+        # （着画の商品は外さない。下限は 着画の商品 + ほか2点）
+        wid = worn.id.removesuffix("#worn")
+        start = min(len(sprites), WORN_MAX_ITEMS[fmt])
+        low = min(len(sprites), 1 + WORN_MIN_OTHERS)
+        last: Candidate | None = None
+        for n in range(start, low - 1, -1):
+            subset, removed = reduce_items(sprites, n, wid)
+            cands = run(subset, worn)
+            if cands[0].checks.verdict == "pass":
+                omitted = omit(removed, "着画を入れるため")
+                if removed:
+                    log(f"  着画を入れるため {len(removed)} 点を外した")
+                break
+            last = cands[0]
+            log(f"  着画つき {n} 点: 検査に通らない（{'; '.join(cands[0].checks.problems)}）")
             cands = []
+        if not cands:
+            fallback = "着画を入れると検査に通らなかった: " + "; ".join(
+                last.checks.problems if last else []
+            )
+            log(f"  着画なしに戻す: {fallback}")
     if not cands:
-        for k in range(brief.candidates):
-            lay = build(k, None)
-            cands.append(Candidate(brief.seed + k, lay, check_layout(lay, ms)))
+        # 着画なしは、ブリーフの点数をなるべく保つ。検査に通らないときだけ後ろから減らす
+        first: list[Candidate] | None = None
+        for n in range(len(sprites), (1 if single else MIN_ITEMS) - 1, -1):
+            subset, removed = reduce_items(sprites, n, None)
+            got = run(subset, None)
+            first = first or got
+            if got[0].checks.verdict == "pass" or single:
+                cands = got
+                omitted = omit(removed, "この形式に入りきらず、検査に通らなかったため")
+                if removed:
+                    log(f"  検査に通るよう {len(removed)} 点を外した")
+                break
+        if not cands or cands[0].checks.verdict != "pass":
+            cands, omitted = first or cands, []  # どれも通らない: 全点で needs_review にする
+    dropped = [*dropped, *omitted]
     for c in cands:
         c.layout.worn_candidates = worn_candidates
         c.layout.worn_fallback = fallback

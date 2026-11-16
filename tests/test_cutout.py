@@ -134,7 +134,8 @@ def test_grade_checks_weak_edge_and_rough_top():
     weak_rough = cutout.Quality(0.3, False, 1, 0.8, edge_delta=10.0, roughness=0.0012)
     status, reasons = cutout.grade(weak_rough)
     assert status == "check" and "境目が弱く" in reasons[0]
-    assert cutout.grade(cutout.Quality(0.3, False, 1, 0.8, edge_delta=40.0, roughness=0.0012))[0] == "ok"
+    strong = cutout.Quality(0.3, False, 1, 0.8, edge_delta=40.0, roughness=0.0012)
+    assert cutout.grade(strong)[0] == "ok"
     rough = cutout.Quality(0.3, False, 1, 0.8, roughness=0.004)
     assert cutout.grade(rough)[0] == "check"
 

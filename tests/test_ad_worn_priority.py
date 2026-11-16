@@ -25,8 +25,8 @@ def worn_sprite(pid):
 @pytest.mark.parametrize(
     "label, short",
     [
-        (LONG, "ネルシャツ ¥6,800"),
-        ("A の B の C ¥12,000", "B の C ¥12,000"),
+        (LONG, LONG.split(" の ")[0] + " ¥6,800"),  # まず品名を外してブランドを残す
+        ("A の B の C ¥12,000", "A ¥12,000"),
         ("ネルシャツ ¥5,800", None),  # ブランドの部分が無い
         ("ブランド の ネルシャツ", None),  # 価格が無い
         ("ブランド の ネルシャツ ¥", None),
@@ -46,7 +46,8 @@ def test_long_label_is_shortened_before_going_straight_or_smaller():
     it = ac.ItemState(sp, 300, 540, 700, 4.0)
     ok, _ = ac.place_texts([it], fixed, geo, MS, __import__("random").Random(0), ac.LABEL_STEPS[:1])
     assert ok and it.placed
-    assert it.label_full == LONG and it.sprite.label == "ネルシャツ ¥6,800"
+    assert it.label_full == LONG and it.sprite.label in ac.shorten_steps(LONG)
+    assert it.sprite.label.endswith("¥6,800")
     assert not it.straight and it.fs == ac.LABEL_STEPS[0]  # 小さくも、まっすぐにもしていない
     # 短くしなくて入るものは、そのまま
     sp2 = ac.Sprite("s2", "ネルシャツ ¥6,800", Path("/x/s.png"), ellipse_alpha(240, 300))
@@ -203,3 +204,11 @@ def test_link_keeps_20px_from_other_items_and_text():
             pts = np.round(np.array(got["pts"])).astype(int)
             near = cv2.dilate(taken.astype(np.uint8), np.ones((41, 41), np.uint8)) > 0
             assert not near[pts[3:-3, 1], pts[3:-3, 0]].any()
+
+
+def test_shorten_steps_keep_brand_first_then_name():
+    assert ac.shorten_steps("ブランド の ネルシャツ ¥8,070") == [
+        "ブランド ¥8,070",
+        "ネルシャツ ¥8,070",
+    ]
+    assert ac.shorten_steps("ネルシャツ ¥5,800") == []

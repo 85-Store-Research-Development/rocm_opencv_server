@@ -1441,20 +1441,45 @@ def item_overlap_ratio(a: np.ndarray, b: np.ndarray) -> float:
     return inter / small if small else 0.0
 
 
-def shorten_label(label: str) -> str | None:
-    """「<ブランド> の <品名> ¥<価格>」の形のときだけ、ブランドの部分を外した「<品名> ¥<価格>」。
-    価格は必ず残す。その形でなければ None。"""
+PRICE_TAIL = re.compile(r" (?P<price>¥\d[\d,]*)$")
+
+
+def shorten_steps(label: str) -> list[str]:
+    """「<ブランド> の <品名> ¥<価格>」の形のラベルを短くする段。
+    先に品名を外して「<ブランド> ¥<価格>」
+    （ブランドは商品の違いが分かる手がかりで、品名は見出しや絵で分かるので、ブランドを残す）、
+    それでも入らなければ「<品名> ¥<価格>」。価格は必ず残す。その形でなければ空。"""
     m = SHORT_LABEL.match(label)
-    return m.group("rest") if m else None
+    if not m:
+        return []
+    rest = m.group("rest")
+    price = PRICE_TAIL.search(rest)
+    steps = [f"{m.group('brand')} {price.group('price')}"] if price else []
+    steps.append(rest)
+    return [s for s in steps if len(s) < len(label)]
+
+
+def shorten_label(label: str) -> str | None:
+    """短くする最初の段（「<ブランド> ¥<価格>」）。短くできなければ None。"""
+    steps = shorten_steps(label)
+    return steps[0] if steps else None
 
 
 def _shorten(it: ItemState) -> bool:
     """輪郭に入らないラベルを短くする（文字を小さくするより先に）。短くできたら True。"""
-    short = None if it.sprite.worn or it.label_full else shorten_label(it.sprite.label)
-    if not short:
+    if it.sprite.worn:
         return False
-    it.label_full = it.sprite.label
-    it.sprite = replace(it.sprite, label=short)
+    full = it.label_full or it.sprite.label
+    steps = shorten_steps(full)
+    # まだ使っていない次の段（いまのラベルより短い物）へ進む
+    nxt = next((s for s in steps if len(s) < len(it.sprite.label) and s != it.sprite.label), None)
+    if it.label_full and it.sprite.label in steps:
+        later = steps[steps.index(it.sprite.label) + 1 :]
+        nxt = later[0] if later else None
+    if not nxt:
+        return False
+    it.label_full = full
+    it.sprite = replace(it.sprite, label=nxt)
     return True
 
 

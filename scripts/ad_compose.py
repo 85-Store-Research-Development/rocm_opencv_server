@@ -108,7 +108,11 @@ def run_briefs(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--brief", type=Path, action="append", help="ブリーフの JSON（複数可）")
-    p.add_argument("--crm-base", help="CRM のベース URL。未処理のブリーフを受け取り、結果を返す")
+    p.add_argument(
+        "--crm-base",
+        default=os.getenv("AD_CRM_BASE"),
+        help="CRM のベース URL。未処理のブリーフを受け取り、結果を返す（AD_CRM_BASE でも渡せる）",
+    )
     p.add_argument("--out", type=Path, default=Path("out"))
     p.add_argument("--formats", help="例: 4:5,1:1,9:16（無ければブリーフの format）")
     p.add_argument("--fonts", type=Path, default=os.getenv("AD_FONTS"))
@@ -132,6 +136,10 @@ def main() -> None:
     if args.crm_base:
         raws += fetch_pending_briefs(args.crm_base)
     if not raws:
+        if args.crm_base:
+            # 定期実行（deploy/ad-compose.timer）では、これがふつう。モデルを読み込まずに終わる
+            print("未処理の案はありません")
+            return
         p.error("--brief か --crm-base が要ります")
     critic = None
     if args.critique:

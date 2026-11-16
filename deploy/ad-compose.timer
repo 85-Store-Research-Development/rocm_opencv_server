@@ -1,0 +1,12 @@
+# ad-compose.service を 10 分ごとに起こす（入れ方は service の先頭）。
+# 前の回が終わっていなければ、その回は起こさない（oneshot なので重ならない）
+[Unit]
+Description=CRM の広告の案の画像待ちを 10 分ごとに見る
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

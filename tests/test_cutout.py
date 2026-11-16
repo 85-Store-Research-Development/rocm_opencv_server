@@ -317,3 +317,11 @@ def test_method_for_splits_by_item_type(monkeypatch):
     assert cutout.method_for("T-Shirts") == cutout.METHOD_BIREFNET
     monkeypatch.setenv("CUTOUT_METHOD", "sam2")
     assert cutout.method_for("Shirts") == cutout.DEFAULT_METHOD
+
+
+def test_hanging_pants_are_not_flagged_as_tall_but_a_person_is():
+    q = cutout.Quality(0.3, False, 1, 0.7, aspect=2.1)
+    assert q.grade()[0] == "check"  # 服（上着など）は 1.9 超で人まで含む疑い
+    assert q.grade("Trousers")[0] == "ok" and q.grade("Short Trousers")[0] == "ok"
+    tall = cutout.Quality(0.3, False, 1, 0.7, aspect=2.8)
+    assert tall.grade("Trousers")[0] == "check"  # 胴から足先まで含むなら、パンツでも確認

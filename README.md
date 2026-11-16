@@ -271,6 +271,35 @@ uv run --group clip --group clef-local python -m scripts.ad_compose \
   なら2つは置けた。通らなければ `needs_review`。`meta` に `layout: "single"`・`callouts_wanted` / `callouts_placed` /
   `callouts_placed_kinds` / `callouts_dropped`（省いたメモ `{kind, text, reason}`）・`worn_used`・`detail_photos_used`・
   `price_badge` / `stamp_placed` を入れる（従来の形の `meta` には増えない）
+- 新品のまとめ見せ（`layout: "lineup"`。`app/ad_lineup.py`・`app/ad_lineup_layout.py`）: 同じシリーズの**型ちがい・色ちがい・素材ちがい**を
+  1枚に並べる。新品は同じ商品にサイズ・色の展開があるので「一点もの」とは言わず、型の名前・サイズ・価格・色の名前・事実の札を添える。
+  商品は `items` ではなく `lineup.groups[].items[]` に置く（`id`・`image`・`images`・`item_type` は今までと同じ。`color` は色の名前）。
+  ```json
+  "layout": "lineup",
+  "lineup": {
+    "style": "compare",                 // compare 型くらべ / colors 色ならべ / catalog シリーズ図鑑 / brand ブランド特集
+    "title_note": "接結。空気をふくむ生地",   // 共通の売りの一言（蛍光ペンの帯。24字まで。無くてよい）
+    "brand": "BRAND",                   // brand のときだけ必要（題字。16字まで）
+    "groups": [{"name": "クルーネック", "price_text": "¥17,600", "sizes": "S / M / L / XL",
+                "items": [{"id": "a1", "image": "https://…", "images": ["…"], "item_type": "Sweaters", "color": "ネイビー"}]}],
+    "badges": ["新品", "ウール11%"]     // 事実の札（3つまで・12字まで）
+  }
+  ```
+  型は compare 2〜3・colors 1（商品は2つ以上）・catalog 2〜4・brand 2〜5（型ごとに先頭の1点だけ使う）。1つの型は5点まで、全体は10点まで
+  （超える分は後ろから省いて `notes` に残す）。`color` は10字まで（長いと小さくなり、入らなければ `needs_review`）。知らない `style` は
+  collage に落とす（商品を並べるだけ。2〜6点）。`lineup` が無い・`layout` が別の値なら今までの形。**`image` は人が写っていない、
+  吊るした・平置きの1枚を選ぶこと**（パンツは着用写真から切り抜けない。同じ商品の色ちがいは色ごとの写真を使う）。
+  色ちがいは必ず実物の写真（着色で作らない）。共通: 見出し・ひとこと・店名・コピー・季節・配色・落書き・`worn_note` は今までと同じ。
+- lineup の組み方: 型くらべは段ごとに「型の名前（手書き・全部の型で同じ大きさ）・サイズ・価格の札」と「色ちがいの扇」を左右互い違いに置く。
+  色ならべは見出し（型の名前・サイズ・価格）の下に、同じ高さで1〜3段に並べ、色の名前と色見本の丸（切り抜きの中央値の色）を添える。
+  シリーズ図鑑は番号つきの段（番号・名前・価格の札）と波線の区切りで、色の名前を各商品の下に。ブランド特集は大きな題字の下に
+  collage（輪郭に沿う「名前 価格」）を置く。着画（`images` から探す）は横の端に1枚（幅は画面の 21%）。着画のために外してよい商品は1点まで
+  （`LINEUP_WORN_MAX_DROP`）で、入らなければ着画を諦める。入りきらないときは後ろから1点ずつ外し、型の最後の1点は残す。それでも通らなければ
+  後ろの型を丸ごと省く（style の下限まで）。省いた商品は `dropped_items` に残る
+- lineup の検査（`ad_lineup.check_plan`。`check_layout` から呼ぶ）: 型の名前が 52px 以上・色の名前が 32px 以上（1080 幅）、文字が商品・ほかの文字・
+  安全域の外に出ない、価格の札が商品（12% まで）や文字に重ならない、同じ型の色ちがいどうしの重なりは 55% まで・ほかの商品との重なりは 12% まで、
+  載った型が style の下限以上。通らなければ `needs_review`。`meta` に `layout: "lineup"`・`lineup_style`・`groups_wanted` / `groups_placed`・
+  `price_badges`・`lineup_notes` を入れる
 - 着画が優先（複数点の組み）: 着画つきで検査に通らないとき、着画を諦める前に、商品を**ブリーフの並びの後ろから1点ずつ**
   減らしてやり直す（着画の商品は外さない。下限は着画の商品 + ほか2点）。形式ごとの目安は 4:5 が4点・1:1 が3点・9:16 が3点まで
   （着画の商品を含む。`WORN_MAX_ITEMS`。試して、これより多いと文字と商品が小さくなる）。外した商品は `dropped_items` に

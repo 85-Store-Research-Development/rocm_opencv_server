@@ -151,3 +151,10 @@ def test_page_is_self_contained_and_escapes():
     assert "http" not in out.replace("http-equiv", "")
     assert "2&lt;b&gt;" in out and "1.png" in out
     assert "ok 1 ・ check 0 ・ fail 1" in out
+
+
+def test_tall_narrow_mask_needs_check():
+    q = cutout.measure(blob(box=(80, 10, 120, 190)), 0.8)
+    assert q.aspect > cutout.MAX_ASPECT
+    status, reasons = q.grade()
+    assert status == "check" and any("細長い" in r for r in reasons)

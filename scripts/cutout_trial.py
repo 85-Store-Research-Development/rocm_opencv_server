@@ -10,7 +10,8 @@
   ... python -m scripts.cutout_trial https://.../a.jpg ./b.png
 
 出力: data/cutout/<id>.png（切り抜き）・<id>_src.jpg（元の写真）・report.json・
-index.html（1ファイル・画像は相対パス・外部の読み込みなし）。判定が fail の写真は切り抜かず、写真のままにする。
+index.html（1ファイル・画像は相対パス・外部の読み込みなし）。
+判定が fail の写真は切り抜かず、写真のままにする。
 モデルは手元の ~/models をオフラインで読む（app/cutout.py）。商品の画素は描き直さない。
 """
 
@@ -88,6 +89,7 @@ def page(rows: list[dict]) -> str:
         q = r.get("quality") or {}
         meta = (
             f"面積 {q['area_ratio']:.0%} ・確信度 {q['box_score']:.2f} ・塊 {q['components']}"
+            f" ・縦横比 {q.get('aspect', 1):.1f}"
             if q
             else ""
         )

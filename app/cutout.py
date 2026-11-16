@@ -55,11 +55,13 @@ FAIL_AREA_MIN = 0.03  # マスクが画像のこれ未満なら、服を捉え�
 FAIL_AREA_MAX = 0.92  # これ超なら、背景まで取っている
 CHECK_AREA_MIN = 0.10
 CHECK_AREA_MAX = 0.75
-CHECK_BOX_SCORE = 0.40
+CHECK_BOX_SCORE = 0.50
 # 画像の端 1px のうち、マスクが触れている割合がこれ以上なら「見切れている」
 BORDER_TOUCH = 0.01
 # 後処理のあとに残る連結成分のうち、最大のこの割合以上のものを「別の塊」として数える
 COMPONENT_RATIO = 0.05
+# マスクの外接矩形の 高さ ÷ 幅 がこれ超なら、着ている人まで取っている疑い（長いコートで 1.5 ほど）
+MAX_ASPECT = 1.9
 
 
 @dataclass
@@ -68,6 +70,7 @@ class Quality:
     touches_border: bool
     components: int
     box_score: float
+    aspect: float = 1.0
 
     def grade(self) -> tuple[str, list[str]]:
         return grade(self)
@@ -159,7 +162,10 @@ def measure(mask: np.ndarray, box_score: float) -> Quality:
     edges = np.concatenate([mask[0], mask[-1], mask[:, 0], mask[:, -1]])
     count, _, areas = _components(mask)
     big = int((areas >= COMPONENT_RATIO * areas.max()).sum()) if count else 0
+    ys, xs = np.where(mask)
+    aspect = (ys.max() - ys.min() + 1) / (xs.max() - xs.min() + 1) if len(xs) else 1.0
     return Quality(
+        aspect=round(float(aspect), 2),
         area_ratio=round(float(mask.mean()), 4),
         touches_border=bool(edges.mean() >= BORDER_TOUCH),
         components=big,
@@ -182,6 +188,8 @@ def grade(q: Quality) -> tuple[str, list[str]]:
         checks.append("服が画像の端で見切れている")
     if q.components > 1:
         checks.append(f"マスクが{q.components}つの塊に分かれている")
+    if q.aspect > MAX_ASPECT:
+        checks.append(f"縦に細長い（高さ÷幅 {q.aspect:.1f}）。着用写真で人まで含む疑い")
     if q.area_ratio < CHECK_AREA_MIN:
         checks.append(f"マスクが小さい（画像の{q.area_ratio:.0%}）")
     if q.area_ratio > CHECK_AREA_MAX:

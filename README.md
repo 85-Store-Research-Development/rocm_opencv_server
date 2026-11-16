@@ -202,6 +202,38 @@ uv run python -m scripts.item_subtype_report [--subtypes subtypes.json]
 uv run --env-file .env --group clip --group clef-local python -m scripts.cms_photo_batches --dry-run
 ```
 
+## SNS 広告の画像を組む（切り抜き → コラージュ）
+
+切り抜いた商品の写真（`app/cutout.py`）を、雑誌の誌面のようなコラージュにする。濃い一色の地に商品を少し傾けて
+散らし、**服の輪郭に沿って流れる手書きの文字**（ブランド・品名・価格）・白い落書き・太い見出しを重ならないように置く。
+商品の画素は描き直さない（切り抜き・拡大縮小・回転・影だけ）。
+
+```bash
+# ブリーフ（店名・コピー・商品などはすべてここに書く）から。形式は 4:5 / 1:1 / 9:16
+uv run --group clip --group clef-local python -m scripts.ad_compose \
+    --brief brief.json --out out/ --fonts <フォントのフォルダ> --formats 4:5,1:1,9:16 [--critique]
+# CRM から未処理のブリーフを受け取り、作った PNG を返す（ホストは引数で渡す）
+... python -m scripts.ad_compose --crm-base https://<host> --out out/ --fonts <dir>
+```
+
+- ブリーフ: `id` / `format` / `store{name,tagline,area_line}` / `headline`（2行まで）/ `aside` / `palette`（navy・brown・
+  burgundy・green・paper）/ `items[{id,image,label,item_type}]`（2〜6点）/ `seed` / `candidates`。
+  商品は切り抜き（判定が check / fail は外して結果に残す）をキャッシュ（`data/ad-cutout-cache`）して使う
+- 切り抜きの縁（白い服の襟元の欠け）には、背景除去専用の BiRefNet（`ZhengPeng7/BiRefNet`・MIT）を使える。重みは
+  `~/models/birefnet/`（`CUTOUT_BIREFNET_PATH`）に置く（コミットしない）。`CUTOUT_METHOD=sam2+birefnet` か
+  `Cutter.cut(method=...)` で選ぶ。無ければ SAM2 だけに戻る。比べる: `python -m scripts.cutout_compare --help`
+- 規則: 配置は占有マップ（商品のマスク・輪郭の文字の帯・見出しなどの矩形）で重なりを測りながら決める。検査は
+  文字と商品・文字どうしの重なり、はみ出し、安全域（左右 6%・9:16 は上下 14% を文字なし）、商品の小ささ、見出しの行数。
+  `candidates` の数だけ種を変えて作り、pass の中で点数の高い物を残す（pass が無ければ `needs_review`）。
+  定数は `app/ad_compose.py` の上のほうに名前付きでまとめてある
+- 出力: `out/<id>_<形式>.png`（4:5 は `4x5`）・`.layout.json`（種・位置・検査・外した商品）・`index.html`（候補を並べた確認用）
+- 書体は `--fonts`（DM Sans・Caveat・Yomogi など OFL。**リポジトリには入れない**）と、システムの Noto Sans CJK JP。
+  Chrome は `--chrome` か `AD_CHROME`。`--critique` は手元の Qwen3-VL（タグ読みと同じ重み）で上位の候補を採点する
+  （読めなければ飛ばす）
+- CRM との受け渡し: `GET <base>/api/ads/briefs?status=pending`（`{"briefs":[...]}`）→ 形式ごとに
+  `POST <base>/api/ads/briefs/<id>/creatives`（multipart: `image` と、`meta` に JSON 文字列
+  `{format, seed, score, verdict, checks, dropped_items}`）
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |

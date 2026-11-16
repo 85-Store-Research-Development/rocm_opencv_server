@@ -23,6 +23,29 @@ from PIL import Image
 
 DINO_PATH = os.getenv("CUTOUT_DINO_PATH", "~/models/grounding-dino-base")
 SAM_PATH = os.getenv("CUTOUT_SAM_PATH", "~/models/sam2.1-hiera-large")
+# 背景除去専用の BiRefNet（MIT。一般用の重み）。無ければ SAM2 だけで切り抜く
+BIREFNET_PATH = os.getenv("CUTOUT_BIREFNET_PATH", "~/models/birefnet")
+# 切り抜きの方式（Result.method）
+METHOD_SAM2 = "sam2"
+METHOD_BIREFNET = "sam2+birefnet"
+# 既定の方式。外套の襟元にハンガーが入る例があるため、既定は SAM2 だけのまま。
+# CUTOUT_METHOD=sam2+birefnet か cut(method=...) で選ぶ
+DEFAULT_METHOD = os.getenv("CUTOUT_METHOD", METHOD_SAM2)
+# 品目で使い分ける（method を指定せず、CUTOUT_METHOD も無いとき）。
+# 前が開く外套は襟元にハンガーの肩が見えていて、BiRefNet がそれを前景に入れる。
+# T シャツ・シャツ・ニット・スウェットは、襟ぐりの欠けが BiRefNet で埋まる。暫定（34 点の比較から）
+OUTERWEAR_TYPES = frozenset({"coats & jackets", "jackets", "coats", "vests", "outerwear"})
+
+
+def method_for(product_type: str | None) -> str:
+    """品目から切り抜きの方式を決める。CUTOUT_METHOD があればそれを優先。
+    品目が分からなければ SAM2 だけ"""
+    if os.getenv("CUTOUT_METHOD"):
+        return DEFAULT_METHOD
+    t = (product_type or "").strip().lower()
+    if not t or t in OUTERWEAR_TYPES:
+        return METHOD_SAM2
+    return METHOD_BIREFNET
 
 # 品目（Shopify の商品タイプの英語名）→ 検出に使う語。無ければ GENERIC
 PROMPTS = {
@@ -50,6 +73,44 @@ FEATHER_SIGMA = 1.0
 # 切り詰めるときに残す余白（切り抜いた物の長辺に対する割合）
 CROP_MARGIN = 0.03
 
+# --- 境目の弱さ・輪郭のギザギザ（白い服 × 白い壁で襟ぐりなどが欠けるのを拾う。暫定） ---
+EDGE_GAP = 0.004  # 境目から離す幅（画像の長辺に対する割合。最低 3px）
+EDGE_BAND = 0.02  # 内側・外側の帯の外端（同。最低で EDGE_GAP + 6px）
+EDGE_WINDOW = 0.06  # 帯の色を平均する窓の大きさ（同）
+EDGE_MAX_SIDE = 1024  # 境目の弱さは、長辺をこれまで縮めて測る
+NO_EDGE_DELTA = 99.0  # 測れなかったときの値（問題なし）
+ROUGH_KERNEL = 0.02  # 小さな凹凸とみなす大きさ（マスクの幅に対する割合）
+ROUGH_TOP = 0.45  # 輪郭を見る上の部分（マスクの高さに対する割合）
+
+# check にするしきい値（data/cutout の20点と、Tシャツ・ニット・シャツの14点で決めた。暫定）
+EDGE_DELTA_CHECK = 21.0  # 上の部分の境目の ΔE の中央値がこれ未満: 白い服 × 白い壁で境目が弱い
+ROUGH_CHECK = 0.0020  # 上の部分の輪郭のギザギザ（top_roughness）がこれ以上: 襟元などが欠けている
+# 境目が弱い（淡い色の服）だけでは外さない。欠けていない淡い服が多く、白い服が使えなくなるため。
+# 境目が弱い服は、ギザギザのしきい値を厳しくして見る
+# （きれいな淡い服は 0.0005 以下・欠けた白Tは 0.0023。暫定）
+ROUGH_CHECK_WEAK_EDGE = 0.0010
+
+# --- BiRefNet との合わせ方（SAM2 = 服はどれか、BiRefNet = 縁の細かさ。暫定） ---
+# BiRefNet に渡す正方形の大きさ（この重みの学習時の大きさ）
+BIREFNET_SIZE = 1024
+# DINO の箱をこの割合だけ広げた範囲に BiRefNet を当てる（箱が服より小さくても縁が切れないように）
+BIREFNET_CROP_MARGIN = 0.15
+# SAM2 のマスクの外で BiRefNet のアルファを採る幅（短辺に対する割合。最低 3px）。縁の細かさを足す
+# ぶんだけ。広げるとハンガーのフックなど服でない物が入る
+BIREFNET_GROW = 1 / 200
+# 欠けた襟元・肩を埋める範囲: SAM2 のマスクを大きな丸で閉じた（へこみを埋めた）形の中で、マスクから
+# BIREFNET_FILL_GROW 以内。ハンガーの先のように外へ出っ張る物は、へこみではないので入らない
+BIREFNET_CLOSE = 1 / 20
+BIREFNET_FILL_GROW = 1 / 40
+# SAM2 のマスクをこの幅だけ内側へ寄せた範囲は、BiRefNet が薄くしても不透明のままにする
+# （服の中の模様・白い面を BiRefNet が背景と見て穴をあけないように）
+BIREFNET_CORE = 1 / 120
+# SAM2 のマスクの外で採るアルファは、この幅（短辺に対する割合。最低 3px）より細い物を捨てる
+# （ハンガーのフック・針金は細い。欠けた襟元を埋める面は太い）
+BIREFNET_THIN = 1 / 150
+# 合わせたアルファのうち、この値を超えた所を「服」として判定・孤立した粒の除去に使う
+BIREFNET_SOLID = 0.5
+
 # --- 判定のしきい値 ---
 FAIL_AREA_MIN = 0.03  # マスクが画像のこれ未満なら、服を捉えていない
 FAIL_AREA_MAX = 0.92  # これ超なら、背景まで取っている
@@ -71,6 +132,8 @@ class Quality:
     components: int
     box_score: float
     aspect: float = 1.0
+    edge_delta: float = NO_EDGE_DELTA  # 上の部分の境目の色の差（小さいほど境目が弱い）
+    roughness: float = 0.0  # 上の部分の輪郭のギザギザ
 
     def grade(self) -> tuple[str, list[str]]:
         return grade(self)
@@ -83,6 +146,7 @@ class Result:
     status: str
     reasons: list[str] = field(default_factory=list)
     seconds: float = 0.0
+    method: str = METHOD_SAM2  # 切り抜きの方式: sam2 / sam2+birefnet
 
     def summary(self) -> dict:
         return {
@@ -90,6 +154,7 @@ class Result:
             "reasons": self.reasons,
             "quality": asdict(self.quality) if self.quality else None,
             "seconds": round(self.seconds, 2),
+            "method": self.method,
         }
 
 
@@ -157,7 +222,78 @@ def crop_to_content(rgba: Image.Image, margin: float = CROP_MARGIN) -> Image.Ima
     return rgba.crop(box)
 
 
-def measure(mask: np.ndarray, box_score: float) -> Quality:
+def lab_image(image: Image.Image) -> np.ndarray:
+    """RGB の画像を Lab（float32）にする。色の差の目安に使う。"""
+    rgb = np.asarray(image.convert("RGB"))
+    return cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
+
+
+def edge_contrast_top(lab: np.ndarray, mask: np.ndarray) -> float:
+    """マスクの上の部分（襟・肩のあたり）の境目で、内側と外側の色の差（Lab の ΔE の中央値）。
+
+    白い服 × 白い壁のように境目が弱いと、襟ぐりなどが欠けやすい（小さいほど弱い）。内側（縁から
+    EDGE_GAP〜EDGE_BAND の帯）と外側の帯の平均の色を、境目の近くでそれぞれ求めて、その差を見る。
+    見られる境目が無ければ、十分大きい値（問題なし）を返す。"""
+    h, w = mask.shape
+    scale = min(1.0, EDGE_MAX_SIDE / max(h, w))
+    if scale < 1.0:  # 重いので縮めて測る
+        size = (round(w * scale), round(h * scale))
+        lab = cv2.resize(lab, size, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+        h, w = mask.shape
+    side = max(h, w)
+    m8 = mask.astype(np.uint8)
+    ys = np.where(m8.any(axis=1))[0]
+    if len(ys) == 0:
+        return NO_EDGE_DELTA
+    din = cv2.distanceTransform(m8, cv2.DIST_L2, 3)
+    dout = cv2.distanceTransform(1 - m8, cv2.DIST_L2, 3)
+    r0 = max(3, round(side * EDGE_GAP))
+    r1 = max(r0 + 6, round(side * EDGE_BAND))
+    ring_in = ((din >= r0) & (din <= r1)).astype(np.float32)
+    ring_out = ((dout >= r0) & (dout <= r1)).astype(np.float32)
+    k = max(15, round(side * EDGE_WINDOW)) | 1
+    w_in = cv2.boxFilter(ring_in, -1, (k, k))
+    w_out = cv2.boxFilter(ring_out, -1, (k, k))
+    mean_in = (
+        cv2.boxFilter(lab * ring_in[:, :, None], -1, (k, k)) / np.maximum(w_in, 1e-6)[:, :, None]
+    )
+    mean_out = (
+        cv2.boxFilter(lab * ring_out[:, :, None], -1, (k, k)) / np.maximum(w_out, 1e-6)[:, :, None]
+    )
+    delta = np.linalg.norm(mean_in - mean_out, axis=2)
+    edge = (din > 0) & (din <= 2) & (w_in > 1e-4) & (w_out > 1e-4)
+    edge[ys[0] + max(1, round((ys[-1] + 1 - ys[0]) * ROUGH_TOP)) :] = False  # 上の部分だけ
+    if not edge.any():
+        return NO_EDGE_DELTA
+    return float(np.median(delta[edge]))
+
+
+def top_roughness(mask: np.ndarray) -> float:
+    """マスクの上の部分（襟・肩のあたり）の輪郭のギザギザ。小さな凹凸の面積 ÷ その部分の外周の
+    長さを、マスクの幅で割った値（欠けて穴のあいた襟は大きく、滑らかな輪郭は小さい）。"""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return 0.0
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    width = x1 - x0
+    px = max(3, round(width * ROUGH_KERNEL))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
+    m8 = np.pad(mask.astype(np.uint8), px + 2)
+    closed = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, kernel)
+    opened = cv2.morphologyEx(m8, cv2.MORPH_OPEN, kernel)
+    diff = ((closed > 0) & (m8 == 0)) | ((m8 > 0) & (opened == 0))
+    pad = px + 2
+    top = slice(pad + y0, pad + y0 + max(1, round((y1 - y0) * ROUGH_TOP)))
+    sub = diff[top, pad + x0 : pad + x1]
+    cs, _ = cv2.findContours(m8[top, pad + x0 : pad + x1], cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    perim = sum(cv2.arcLength(c, True) for c in cs)
+    if perim <= 0:
+        return 0.0
+    return float(sub.sum() / perim / width)
+
+
+def measure(mask: np.ndarray, box_score: float, image: Image.Image | None = None) -> Quality:
     h, w = mask.shape
     edges = np.concatenate([mask[0], mask[-1], mask[:, 0], mask[:, -1]])
     count, _, areas = _components(mask)
@@ -170,6 +306,10 @@ def measure(mask: np.ndarray, box_score: float) -> Quality:
         touches_border=bool(edges.mean() >= BORDER_TOUCH),
         components=big,
         box_score=round(float(box_score), 3),
+        edge_delta=round(edge_contrast_top(lab_image(image), mask), 1)
+        if image is not None
+        else NO_EDGE_DELTA,
+        roughness=round(top_roughness(mask), 5),
     )
 
 
@@ -196,6 +336,14 @@ def grade(q: Quality) -> tuple[str, list[str]]:
         checks.append(f"マスクが大きい（画像の{q.area_ratio:.0%}）")
     if q.box_score < CHECK_BOX_SCORE:
         checks.append(f"検出の確信度が低め（{q.box_score:.2f}）")
+    weak_edge = q.edge_delta < EDGE_DELTA_CHECK
+    if weak_edge and ROUGH_CHECK_WEAK_EDGE <= q.roughness < ROUGH_CHECK:
+        checks.append(
+            f"服と背景の境目が弱く（色の差 {q.edge_delta:.0f}）、"
+            f"輪郭も少し荒い（{q.roughness:.4f}）。欠けている疑い"
+        )
+    if q.roughness >= ROUGH_CHECK:
+        checks.append(f"襟・肩のあたりの輪郭がギザギザ（{q.roughness:.4f}）。欠けている疑い")
     return ("check", checks) if checks else ("ok", [])
 
 
@@ -219,10 +367,69 @@ def prompt_for(product_type: str | None) -> str:
     return f"{base} . {GENERIC_PROMPT}" if base else GENERIC_PROMPT
 
 
+def _px(mask: np.ndarray, ratio: float, minimum: int = 1) -> int:
+    return max(minimum, round(min(mask.shape) * ratio))
+
+
+def refine_alpha(sam_mask: np.ndarray, fg: np.ndarray) -> np.ndarray:
+    """SAM2 のマスク（服はどれか）と BiRefNet の前景アルファ（縁の細かさ。float）を合わせる。
+
+    - SAM2 のマスクを BIREFNET_GROW だけ膨らませた領域の中だけ BiRefNet のアルファを採る。外は 0
+      （ハンガーのフックなど、SAM2 のマスクから離れた物は入らない）。
+    - SAM2 のマスクの内側（BIREFNET_CORE だけ縁から離れた所）は不透明にする。
+    - 戻り値は float32（0〜1）。画素は触らない（アルファだけ）。"""
+    sam = sam_mask.astype(np.uint8)
+    grow = _px(sam, BIREFNET_GROW, 3)
+    core = _px(sam, BIREFNET_CORE, 2)
+
+    def ellipse(r: int) -> np.ndarray:
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2)
+
+    near = cv2.dilate(sam, ellipse(grow)) > 0
+    # へこみ（欠け）を埋める範囲。大きく閉じる前に画像の端で切れないよう、余白を足して処理する
+    pad = _px(sam, BIREFNET_CLOSE, 3) + 2
+    closed = cv2.morphologyEx(np.pad(sam, pad), cv2.MORPH_CLOSE, ellipse(pad - 2))[
+        pad:-pad, pad:-pad
+    ]
+    fill = (closed > 0) & (cv2.dilate(sam, ellipse(_px(sam, BIREFNET_FILL_GROW, 3))) > 0)
+    near |= fill
+    inner = cv2.erode(sam, ellipse(core)) > 0
+    out = np.where(near, np.clip(fg, 0.0, 1.0), 0.0).astype(np.float32)
+    # マスクの外で採った分から、細い物（ハンガーのフックなど）を捨てる
+    thin = _px(sam, BIREFNET_THIN, 3)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * thin + 1,) * 2)
+    solid = (out > BIREFNET_SOLID).astype(np.uint8)
+    # 開いた形を少しだけ戻す（k のまま戻すと、太い面に付いた細い物の根元まで残る）
+    k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thick = cv2.dilate(cv2.morphologyEx(solid, cv2.MORPH_OPEN, k), k2) > 0
+    out = np.where((sam > 0) | thick, out, 0.0).astype(np.float32)
+    out[inner] = 1.0
+    return out
+
+
+def finish_alpha(
+    image: Image.Image, sam_mask: np.ndarray, fg: np.ndarray, box_score: float
+) -> Result:
+    """SAM2 のマスクと BiRefNet のアルファから、判定・RGBA まで（モデルを使わない部分）。
+    判定は合わせたあとのアルファ（BIREFNET_SOLID 超）で測り直す。"""
+    alpha = refine_alpha(clean_mask(sam_mask), fg)
+    solid = clean_mask(alpha > BIREFNET_SOLID)
+    # 孤立した粒（solid に入らなかった所）のアルファは消す。縁の薄い所は solid を少し広げた中に残す
+    keep = cv2.dilate(solid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    alpha = np.where(keep, alpha, 0.0)
+    q = measure(solid, box_score, image)
+    status, reasons = grade(q)
+    if status == "fail":
+        return Result(None, q, status, reasons, method=METHOD_BIREFNET)
+    a8 = np.round(alpha * 255).astype(np.uint8)
+    rgba = crop_to_content(to_rgba(image, a8))
+    return Result(rgba, q, status, reasons, method=METHOD_BIREFNET)
+
+
 def finish(image: Image.Image, mask: np.ndarray, box_score: float) -> Result:
     """生のマスクから、後処理・判定・RGBA まで（モデルを使わない部分）。"""
     mask = clean_mask(mask)
-    q = measure(mask, box_score)
+    q = measure(mask, box_score, image)
     status, reasons = grade(q)
     if status == "fail":
         return Result(None, q, status, reasons)
@@ -233,10 +440,38 @@ def finish(image: Image.Image, mask: np.ndarray, box_score: float) -> Result:
 # ---------------------------------------------------------------- モデル
 
 
+def _ensure_kornia() -> None:
+    """BiRefNet のモデルのコードは、損失関数のために `from kornia.filters import laplacian` を
+    import している（推論では呼ばれない）。kornia が入っていない環境のために、無いときだけ
+    小さな代わりを差し込む（呼ばれたら NotImplementedError）。本物があればそれを使う。"""
+    import importlib.util
+    import sys
+    import types
+
+    if importlib.util.find_spec("kornia") is not None:
+        return
+
+    def laplacian(*_args, **_kwargs):
+        raise NotImplementedError("kornia は入れていない（推論では使わない損失関数用）")
+
+    pkg = types.ModuleType("kornia")
+    pkg.__path__ = []  # パッケージとして扱わせる
+    filters = types.ModuleType("kornia.filters")
+    filters.laplacian = laplacian
+    pkg.filters = filters
+    sys.modules.setdefault("kornia", pkg)
+    sys.modules.setdefault("kornia.filters", filters)
+
+
 class Cutter:
     """Grounding DINO + SAM2。GPU（ROCm）で動かす。モデルは最初に使うときに読む（オフライン）。"""
 
-    def __init__(self, dino_path: str | None = None, sam_path: str | None = None) -> None:
+    def __init__(
+        self,
+        dino_path: str | None = None,
+        sam_path: str | None = None,
+        birefnet_path: str | None = None,
+    ) -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         import torch
         from transformers import (
@@ -258,6 +493,56 @@ class Cutter:
         )
         self.sam_proc = Sam2Processor.from_pretrained(s, local_files_only=True)
         self.sam = Sam2Model.from_pretrained(s, local_files_only=True).to(self.device).eval()
+        self.birefnet_path = str(Path(birefnet_path or BIREFNET_PATH).expanduser())
+        self.birefnet = None  # 最初に使うときに読む。読めなければ None（SAM2 だけで切り抜く）
+        self._birefnet_tried = False
+        self.birefnet_error = ""
+
+    def load_birefnet(self) -> bool:
+        """BiRefNet を読む（1回だけ試す）。読めなければ理由を残して False（SAM2 だけに戻る）。"""
+        if self._birefnet_tried:
+            return self.birefnet is not None
+        self._birefnet_tried = True
+        try:
+            if not (Path(self.birefnet_path) / "config.json").exists():
+                raise FileNotFoundError(f"{self.birefnet_path} が無い")
+            from transformers import AutoModelForImageSegmentation
+
+            _ensure_kornia()
+            model = AutoModelForImageSegmentation.from_pretrained(
+                self.birefnet_path, trust_remote_code=True, local_files_only=True
+            )
+            self.birefnet = model.to(self.device).eval()
+        except Exception as e:  # noqa: BLE001 - どんな失敗でも SAM2 だけに戻す
+            self.birefnet = None
+            self.birefnet_error = f"{type(e).__name__}: {e}"
+        return self.birefnet is not None
+
+    def foreground(self, image: Image.Image, box: list[float] | None = None) -> np.ndarray:
+        """BiRefNet の前景アルファ（画像と同じ大きさの float32、0〜1）。box があればその周り
+        （BIREFNET_CROP_MARGIN だけ広げた範囲）だけを当て、外は 0。"""
+        torch = self.torch
+        w, h = image.size
+        if box is None:
+            x0, y0, x1, y1 = 0, 0, w, h
+        else:
+            mx = (box[2] - box[0]) * BIREFNET_CROP_MARGIN
+            my = (box[3] - box[1]) * BIREFNET_CROP_MARGIN
+            x0, y0 = max(0, int(box[0] - mx)), max(0, int(box[1] - my))
+            x1, y1 = min(w, int(box[2] + mx) + 1), min(h, int(box[3] + my) + 1)
+        crop = image.crop((x0, y0, x1, y1)).resize((BIREFNET_SIZE, BIREFNET_SIZE), Image.BICUBIC)
+        arr = np.asarray(crop, dtype=np.float32) / 255.0
+        arr = (arr - np.array([0.485, 0.456, 0.406], np.float32)) / np.array(
+            [0.229, 0.224, 0.225], np.float32
+        )
+        x = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
+        dtype = next(self.birefnet.parameters()).dtype
+        with torch.no_grad():
+            pred = self.birefnet(x.to(dtype))[-1].sigmoid().float().cpu()[0, 0].numpy()
+        small = cv2.resize(pred, (x1 - x0, y1 - y0), interpolation=cv2.INTER_CUBIC)
+        out = np.zeros((h, w), np.float32)
+        out[y0:y1, x0:x1] = np.clip(small, 0.0, 1.0)
+        return out
 
     def detect(self, image: Image.Image, product_type: str | None):
         text = prompt_for(product_type)
@@ -284,7 +569,15 @@ class Cutter:
         masks = self.sam_proc.post_process_masks(out.pred_masks.cpu(), inputs["original_sizes"])
         return masks[0][0, 0].numpy().astype(bool)
 
-    def cut(self, image: Image.Image, product_type: str | None = None) -> Result:
+    def cut(
+        self,
+        image: Image.Image,
+        product_type: str | None = None,
+        method: str | None = None,
+    ) -> Result:
+        """method: None=品目で決める（method_for）/ "sam2" / "sam2+birefnet"。
+        BiRefNet が読めなければ
+        黙って SAM2 だけに戻る（Result.method に実際に使った方式が入る）。"""
         import time
 
         t0 = time.time()
@@ -293,6 +586,10 @@ class Cutter:
         if picked is None:
             return Result(None, None, "fail", ["服を検出できなかった"], time.time() - t0)
         box, score = picked
-        result = finish(image, self.segment(image, box), score)
+        mask = self.segment(image, box)
+        if (method or method_for(product_type)) == METHOD_BIREFNET and self.load_birefnet():
+            result = finish_alpha(image, mask, self.foreground(image, box), score)
+        else:
+            result = finish(image, mask, score)
         result.seconds = time.time() - t0
         return result

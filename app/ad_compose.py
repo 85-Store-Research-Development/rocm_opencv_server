@@ -855,7 +855,7 @@ class Sprite:
 
 ALPHA_MAX_H = 700
 # 切り抜きの判定の規則を変えたら上げる（古い判定のキャッシュを使わない）
-CUTOUT_CACHE_VERSION = 2
+CUTOUT_CACHE_VERSION = 3
 
 
 def sprite_from_png(item: BriefItem, png: Path) -> Sprite:

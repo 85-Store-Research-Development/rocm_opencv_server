@@ -128,17 +128,23 @@ def test_top_roughness_is_larger_for_a_notched_collar():
 def test_grade_checks_weak_edge_and_rough_top():
     base = cutout.Quality(area_ratio=0.3, touches_border=False, components=1, box_score=0.8)
     assert cutout.grade(base)[0] == "ok"
-    weak = cutout.Quality(0.3, False, 1, 0.8, edge_delta=10.0)
-    status, reasons = cutout.grade(weak)
-    assert status == "check" and "境目が弱い" in reasons[0]
+    # 淡い色（境目が弱い）だけでは外さない。輪郭が少し荒いときだけ check
+    weak = cutout.Quality(0.3, False, 1, 0.8, edge_delta=10.0, roughness=0.0003)
+    assert cutout.grade(weak)[0] == "ok"
+    weak_rough = cutout.Quality(0.3, False, 1, 0.8, edge_delta=10.0, roughness=0.0012)
+    status, reasons = cutout.grade(weak_rough)
+    assert status == "check" and "境目が弱く" in reasons[0]
+    assert cutout.grade(cutout.Quality(0.3, False, 1, 0.8, edge_delta=40.0, roughness=0.0012))[0] == "ok"
     rough = cutout.Quality(0.3, False, 1, 0.8, roughness=0.004)
     assert cutout.grade(rough)[0] == "check"
 
 
-def test_finish_white_on_white_is_check_not_ok():
+def test_finish_white_on_white_with_clean_outline_stays_ok():
+    """白い服 × 白い壁でも、輪郭がなめらかなら外さない（境目の弱さは品質に残る）"""
     img = photo(garment=(245, 245, 245), wall=(235, 235, 235))
     res = cutout.finish(img, blob(box=(50, 30, 150, 170)), 0.8)
-    assert res.status == "check" and res.rgba is not None
+    assert res.status == "ok" and res.rgba is not None
+    assert res.quality.edge_delta < cutout.EDGE_DELTA_CHECK
 
 
 def test_finish_ok_returns_cropped_rgba():

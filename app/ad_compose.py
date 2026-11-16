@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageFont
 
-from app import ad_season, ad_worn
+from app import ad_season, ad_single, ad_worn
 from app.ad_palette import (  # noqa: F401  色の部品（テスト・外からも ad_compose 経由で使える）
     DEFAULT_PALETTE,
     MIN_CONTRAST,
@@ -218,6 +218,8 @@ class Brief:
     palette_requested: str = ""  # ブリーフの palette（palette は実際に使う色）
     palette_changed_reason: str | None = None
     worn_note: str = ""  # 着画に添える短い手書きの文（無ければ添えない）
+    layout: str = "collage"  # collage（複数を並べる・既定）/ single（1点もの）
+    single: ad_single.Single | None = None  # layout が single のときの 価格・シール・メモ
 
 
 _ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -302,7 +304,15 @@ def parse_brief(raw: dict) -> Brief:
     if not isinstance(raw_items, list):
         problems.append("items は配列にしてください")
         raw_items = []
-    if not MIN_ITEMS <= len(raw_items) <= MAX_ITEMS:
+    layout = ad_single.LAYOUT_NAME if raw.get("layout") == ad_single.LAYOUT_NAME else "collage"
+    single = None
+    if layout == "single":  # 1点もの: 主役は先頭の1点（ほかは使わない）
+        single, single_problems = ad_single.parse_single(raw.get("single"))
+        problems.extend(single_problems)
+        if not 1 <= len(raw_items) <= MAX_ITEMS:
+            problems.append(f"items は 1 点以上にしてください（{len(raw_items)} 点）")
+        raw_items = raw_items[:1]
+    elif not MIN_ITEMS <= len(raw_items) <= MAX_ITEMS:
         problems.append(
             f"items は {MIN_ITEMS}〜{MAX_ITEMS} 点にしてください（{len(raw_items)} 点）"
         )
@@ -366,6 +376,8 @@ def parse_brief(raw: dict) -> Brief:
         palette_options=options,
         palette_requested=palette,
         worn_note=worn_note,
+        layout=layout,
+        single=single,
     )
 
 
@@ -998,6 +1010,7 @@ def prepare_sprites(
     fetch: Callable[[str], bytes] = default_fetch,
     base_dir: Path | None = None,
     log: Callable = print,
+    min_items: int = MIN_ITEMS,
 ) -> tuple[list[Sprite], list[dict]]:
     """各商品を切り抜く（キャッシュがあれば切り抜き直さない）。check / fail は外して理由を返す。"""
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1043,9 +1056,9 @@ def prepare_sprites(
             sprites.append(sprite_from_png(item, png))
         else:
             dropped.append({"id": item.id, "status": meta["status"], "reasons": meta["reasons"]})
-    if len(sprites) < MIN_ITEMS:
+    if len(sprites) < min_items:
         raise CannotCompose(
-            f"切り抜けた商品が{len(sprites)}点で、{MIN_ITEMS}点に足りません"
+            f"切り抜けた商品が{len(sprites)}点で、{min_items}点に足りません"
             f"（外した商品: {json.dumps(dropped, ensure_ascii=False)}）"
         )
     return sprites, dropped
@@ -1527,6 +1540,8 @@ def place_doodles(
     occupied: np.ndarray,
     region: tuple,
     season: Season | None = None,
+    limit: int | None = None,
+    size_scale: float = 1.0,
 ) -> list[Doodle]:
     """空いている所に、種から選んだ数と種類の落書きを置く（占有マップで空きを探す）。
     季節があれば季節の落書きが主（汎用の星・波・矢印も混ぜる）。大きさと傾きにばらつきを付ける。"""
@@ -1538,6 +1553,9 @@ def place_doodles(
     sx0, sy0, sx1, sy1 = geo.safe_rect
     x0, y0, x1, y1 = region
     kinds, want = doodle_sequence(rng, season)
+    if limit is not None:  # 1点もの: 少なめにし、何も指さない矢印は使わない
+        want = min(want, limit)
+        kinds = [k for k in kinds if k != "arrow"]
     size_range = SEASON_DOODLE_SIZE if season else DOODLE_SIZE
     out: list[Doodle] = []
     for kind in kinds:
@@ -1555,7 +1573,7 @@ def place_doodles(
                 kind,
                 rng.uniform(sx0, sx1),
                 rng.uniform(max(sy0, y0 - 60), min(sy1, y1 + 40)),
-                rng.uniform(*size_range) * geo.w / 1080,
+                rng.uniform(*size_range) * geo.w / 1080 * size_scale,
                 rng.uniform(-rot_max, rot_max),
             )
             poly = dd.polygon(pad=4)
@@ -1606,6 +1624,9 @@ class Layout:
     worn_candidates: int = 0  # 着画の候補が見つかった商品の数
     worn_fallback: str | None = None  # 着画を入れられず外したときの理由
     link: dict | None = None  # 着画からアイテム写真への点線の矢印（pts・mask）
+    layout: str = "collage"
+    single: ad_single.SinglePlan | None = None  # 1点ものの メモ・札・細部の写真
+    single_target_h: float = 0.0  # 1点ものの主役の高さの目標（点数用）
 
     def to_json(self) -> dict:
         items = []
@@ -1642,6 +1663,8 @@ class Layout:
             "worn_candidates": self.worn_candidates,
             "worn_fallback": self.worn_fallback,
             "worn_link": None if self.link is None else self.link["pts"],
+            "layout": self.layout,
+            "single": None if self.single is None else self.single.to_json(),
             "season": None if self.season is None else self.season.to_json(),
             "region": [round(v, 1) for v in self.region],
             "blocks": [b.to_json() for b in self.blocks],
@@ -1857,6 +1880,171 @@ def build_layout(
     return lay
 
 
+# ---------------------------------------------------------------- 1点もの（layout: single）
+
+
+def make_single_items(
+    hero_sprite: Sprite,
+    worn: Sprite | None,
+    region: tuple,
+    fmt: str,
+    geo: Geo,
+    rng: random.Random,
+    scale: float,
+) -> tuple[list[ItemState], float]:
+    """主役（と着画）の ItemState。(商品の並び 主役が先頭, 主役の高さの目標)。
+    着画があれば主役の横に置く（主役の外側に、メモを置く空きの列を残す）。縦長の形式では主役の下に置く。"""
+    x0, y0, x1, y1 = region
+    rw, rh = x1 - x0, y1 - y0
+    aspect = hero_sprite.alpha.shape[1] / hero_sprite.alpha.shape[0]
+    tall = rh > 1.15 * rw
+    target = ad_single.HERO_H_RATIO[fmt] * geo.h
+    cap = ad_single.HERO_W_RATIO_WORN if worn else ad_single.HERO_W_RATIO
+    if worn is not None and tall:
+        target = min(target, 0.5 * rh)
+    h = min(target * scale, cap * geo.w / aspect * scale**0.5, ad_single.HERO_H_OF_REGION * rh)
+    h = max(h, MIN_ITEM_H_RATIO * geo.w + 1)
+    ang = rng.choice((-1, 1)) * rng.uniform(*ad_single.HERO_ANGLE)
+    hero = ItemState(hero_sprite, h, (x0 + x1) / 2, (y0 + y1) / 2, ang)
+    items = [hero]
+    if worn is None:
+        hero.cx += rng.uniform(-0.04, 0.04) * geo.w
+        hero.cy += rng.uniform(-0.03, 0.03) * rh
+        clamp_item(hero, region)
+        return items, target
+    w_aspect = worn.alpha.shape[1] / worn.alpha.shape[0]
+    on_left = rng.random() < 0.5  # 着画を置く側
+    wang = rng.choice((-1, 1)) * rng.uniform(*ad_single.WORN_ANGLE)
+    if tall:
+        hx, hy = hero.half_extent()
+        hero.cy = y0 + hy + 8
+        hero.cx = (x0 + x1) / 2 + (0.08 if on_left else -0.08) * rw
+        clamp_item(hero, region)
+        room = y1 - (hero.cy + hy) - ad_single.HERO_GAP
+        wh = min(ad_single.WORN_REL_H_STACK * room + 0.2 * room, 0.5 * rh, 0.62 * geo.w / w_aspect)
+        wh = max(wh, 0.12 * geo.w)
+        wi = ItemState(worn, wh, 0.0, y1 - wh / 2 - 6, wang)
+        whx, _ = wi.half_extent()
+        wi.cx = x0 + whx + 24 if on_left else x1 - whx - 24
+        clamp_item(wi, region)
+        items.append(wi)
+        return items, target
+    wh = min(ad_single.WORN_REL_H * h, 0.9 * rh)
+    wi = ItemState(worn, wh, 0.0, (y0 + y1) / 2 + 0.03 * rh, wang)
+    whx, _ = wi.half_extent()
+    hhx, _ = hero.half_extent()
+    wi.cx = x0 + whx + 10 if on_left else x1 - whx - 10
+    hero.cx = wi.cx + (whx + ad_single.HERO_GAP + hhx) * (1 if on_left else -1)
+    hero.cy = (y0 + y1) / 2 + rng.uniform(-0.03, 0.03) * rh
+    clamp_item(hero, region)
+    clamp_item(wi, region)
+    items.append(wi)
+    return items, target
+
+
+def build_single_layout(
+    brief: Brief,
+    sprites: list[Sprite],
+    fmt: str,
+    seed: int,
+    ms: Measurer,
+    worn: Sprite | None = None,
+    details: list | None = None,
+) -> Layout:
+    """1点ものの候補を1つ組む。主役を大きく置き、価格の札 → メモと引き出し線 → 細部の写真
+    （着画が無いとき）
+        の順に、空いている所へ置く。メモが2つ置けなければ主役を縮めてやり直す。置けないメモは後ろから省く。"""
+    geo = geometry(fmt)
+    size = (geo.w, geo.h)
+    fixed = layout_fixed(brief, fmt, ms)
+    single = brief.single or ad_single.Single()
+    hero_sprite = replace(sprites[0], label="")
+    wanted = len(single.callouts)
+    best: tuple[float, Layout] | None = None
+    scale = 1.0
+    for attempt in range(1, ATTEMPTS + 1):
+        rng = random.Random(f"{seed}:single{attempt}")
+        items, target = make_single_items(hero_sprite, worn, fixed.region, fmt, geo, rng, scale)
+        steps = LABEL_STEPS if attempt == ATTEMPTS else LABEL_STEPS[:1]
+        text_ok, _ = place_texts(items, fixed, geo, ms, rng, steps, straight=True)
+        bg = PALETTES[brief.palette].bg
+        for it in items:
+            it.glow = sinks(it.sprite.light, bg)
+        blocked = np.zeros((geo.h, geo.w), bool)
+        for b in fixed.blocks:
+            blocked |= b.mask(size)
+        for it in items[1:]:  # 着画（と、その文字の帯）
+            blocked |= it.mask(size)
+            if it.arc is not None:
+                raster_band(it.arc[: max(2, int(it.text_len / CONTOUR_STEP) + 1)], it.fs).paint(
+                    blocked
+                )
+        hero_mask = items[0].mask(size)
+        overlap = max(
+            (item_overlap_ratio(hero_mask, it.mask(size)) for it in items[1:]), default=0.0
+        )
+        plan = ad_single.SinglePlan(
+            wanted=wanted,
+            price_text=single.price_text,
+            stamp_text=single.stamp,
+            notes=list(single.notes),
+        )
+        rng_p = random.Random(f"{seed}:plan{attempt}")
+        safe = geo.safe_rect
+        if single.price_text:
+            plan.badge = ad_single.place_badge(
+                single.price_text, hero_mask=hero_mask, blocked=blocked, safe=safe, ms=ms,
+                rng=rng_p, width=geo.w,
+            )  # fmt: skip
+        if single.stamp:  # 札のすぐそばに置く（札を占有に入れる前に探す。札との重なりは自分で見る）
+            plan.stamp = ad_single.place_stamp_tag(
+                single.stamp, plan.badge, hero_mask=hero_mask, blocked=blocked, safe=safe, ms=ms,
+                rng=rng_p, width=geo.w,
+            )  # fmt: skip
+        if plan.badge is not None:
+            blocked |= ad_single.dilate(plan.badge.disc_mask((geo.h, geo.w)), 10)
+        if plan.stamp is not None:
+            ad_single.paint_poly(plan.stamp.polygon(8), blocked)
+        memos, dropped, occ = ad_single.place_memos(
+            single.callouts, hero_mask=hero_mask, blocked=blocked, safe=safe, ms=ms, rng=rng_p,
+            scale=geo.w / 1080,
+        )  # fmt: skip
+        plan.memos, plan.dropped = memos, dropped
+        if worn is None and details:
+            plan.photos = ad_single.place_photos(
+                details,
+                hero_mask=hero_mask,
+                blocked=occ,
+                safe=safe,
+                rng=rng_p,
+                width=geo.w,
+                limit=ad_single.PHOTO_MAX if fmt == "9:16" else 1,
+            )
+            for p in plan.photos:
+                ad_single.paint_poly(p.polygon(10), occ)
+        lay = Layout(
+            fmt, geo.w, geo.h, seed, brief.palette, fixed.blocks, fixed.region, items, [],
+            list(fixed.notes), attempt, scale, brief.palette_requested or brief.palette,
+            brief.palette_changed_reason, brief.season,
+        )  # fmt: skip
+        lay.layout, lay.single, lay.single_target_h = "single", plan, target
+        occ |= hero_mask
+        lay.doodles = place_doodles(
+            random.Random(f"{seed}:doodle"), geo, occ, lay.region, brief.season,
+            limit=ad_single.DOODLE_LIMIT, size_scale=ad_single.DOODLE_SIZE_SCALE,
+        )  # fmt: skip
+        enough = len(memos) >= min(ad_single.MIN_CALLOUTS, wanted)
+        good = enough and overlap <= 0.05 and text_ok
+        rank = (wanted - len(memos)) * 1e4 + (0 if (plan.badge or not single.price_text) else 1e5)
+        rank += overlap * 1e5 + (0 if text_ok else 1e5) + attempt
+        if best is None or rank < best[0]:
+            best = (rank, lay)
+        if good:
+            break
+        scale *= SHRINK
+    return best[1]
+
+
 # ---------------------------------------------------------------- 検査
 
 
@@ -1880,6 +2068,7 @@ class Checks:
     verdict: str = "pass"
     score: float = 0.0
     score_parts: dict = field(default_factory=dict)
+    single: dict | None = None  # 1点ものの検査の数（メモ・線・札・写真）
 
     def violations(self) -> int:
         return len(self.problems)
@@ -1983,6 +2172,41 @@ def check_layout(lay: Layout, ms: Measurer | None = None) -> Checks:
     )
     if c.doodle_overlap_px > TOLERANCE_PX:
         c.problems.append(f"落書きが商品や文字に重なっている（{c.doodle_overlap_px}px）")
+    if lay.single is not None:
+        blocked = np.zeros((H, W), bool)
+        for _, m in texts:
+            blocked |= m
+        for m in masks[1:]:  # 着画
+            blocked |= m
+        sc, sp = ad_single.check_plan(
+            lay.single,
+            hero_mask=masks[0],
+            blocked=blocked,
+            safe=geo.safe_rect,
+            width=W,
+            expect_price=bool(lay.single.price_text),
+            expect_stamp=bool(lay.single.stamp_text),
+        )
+        c.single = asdict(sc)
+        c.problems.extend(sp)
+        c.verdict = "pass" if not c.problems else "fail"
+        c.score, c.score_parts = ad_single.score_plan(
+            lay.single,
+            hero_mask=masks[0],
+            region=lay.region,
+            width=W,
+            height=H,
+            hero_target_h=lay.single_target_h,
+        )
+        contrast = contrast_score(
+            [it.sprite.light for it in lay.items],
+            PALETTES[lay.palette].bg,
+            [it.glow for it in lay.items],
+        )
+        if contrast is not None:
+            c.score_parts["contrast"] = round(contrast, 3)
+            c.score = round((1 - CONTRAST_WEIGHT) * c.score + 100 * CONTRAST_WEIGHT * contrast, 1)
+        return c
     c.verdict = "pass" if not c.problems else "fail"
     c.score, c.score_parts = score_layout(lay, union)
     return c
@@ -2118,6 +2342,7 @@ svg.ov text.stampt{{fill:{pal.text};font-family:"DM Sans","Noto Sans CJK JP",san
 font-weight:700;letter-spacing:.1em;text-anchor:middle}}
 svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;letter-spacing:.03em}}
 .acc{{color:{pal.accent}}}
+{ad_single.css(pal) if lay.single is not None else ""}
 """
     body: list[str] = []
     glow = glow_color(pal)
@@ -2161,6 +2386,8 @@ svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;lette
         else:
             inner = "<br>".join(e(ln) for ln in b.lines)
         body.append(f'<div class="b {cls}" style="{style}">{inner}</div>')
+    if lay.single is not None:
+        body.extend(ad_single.html_parts(lay.single, pal, e, W))
     svg = [f'<svg class="ov" width="{W}" height="{H}" viewBox="0 0 {W} {H}">']
     for d in lay.doodles:
         k = d.size / 100
@@ -2194,6 +2421,8 @@ svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;lette
             f'<text font-size="{it.fs}"><textPath href="#a{i}">{e(it.sprite.label)}'
             f"</textPath></text>"
         )
+    if lay.single is not None:
+        svg.extend(ad_single.svg_parts(lay.single, pal, e))
     svg.append("</svg>")
     return (
         f'<!doctype html><meta charset="utf-8"><style>{css}</style><body>'
@@ -2278,8 +2507,10 @@ class FormatResult:
         """CRM へ返す meta（format・seed・score・verdict・checks・dropped_items・revision）。"""
         extra = {} if self.revision is None else {"revision": self.revision}
         lay = self.best.layout
+        single = {} if lay.single is None else single_meta(lay)
         return {
             **extra,
+            **single,
             "format": self.format,
             "palette_used": lay.palette,
             "palette_changed_reason": lay.palette_changed_reason,
@@ -2292,6 +2523,23 @@ class FormatResult:
             "checks": asdict(self.best.checks),
             "dropped_items": self.dropped,
         }
+
+
+def single_meta(lay: Layout) -> dict:
+    """1点ものの meta。置けたメモの数・省いたメモ・着画か細部の写真を使ったか。"""
+    plan = lay.single
+    worn_used = any(it.sprite.worn for it in lay.items)
+    return {
+        "layout": ad_single.LAYOUT_NAME,
+        "callouts_wanted": plan.wanted,
+        "callouts_placed": len(plan.memos),
+        "callouts_placed_kinds": [m.kind for m in plan.memos],
+        "callouts_dropped": plan.dropped,
+        "worn_used": worn_used,
+        "detail_photos_used": len(plan.photos),
+        "price_badge": plan.badge is not None,
+        "stamp_placed": plan.stamp is not None,
+    }
 
 
 def fmt_slug(fmt: str) -> str:
@@ -2313,6 +2561,7 @@ def compose_format(
     render: bool = True,
     worn: Sprite | None = None,
     worn_candidates: int = 0,
+    details: list | None = None,
 ) -> FormatResult:
     t0 = time.time()
     ms = Measurer(fonts_dir)
@@ -2327,9 +2576,18 @@ def compose_format(
         )
     cands: list[Candidate] = []
     fallback = None
+    single = brief.layout == ad_single.LAYOUT_NAME
+
+    def build(k: int, with_worn: Sprite | None) -> Layout:
+        if single:  # 1点もの。着画が無い（外した）ときだけ細部の写真を添える
+            return build_single_layout(
+                brief, sprites, fmt, brief.seed + k, ms, with_worn, None if with_worn else details
+            )
+        return build_layout(brief, sprites, fmt, brief.seed + k, ms, with_worn)
+
     if worn is not None:
         for k in range(brief.candidates):
-            lay = build_layout(brief, sprites, fmt, brief.seed + k, ms, worn)
+            lay = build(k, worn)
             cands.append(Candidate(brief.seed + k, lay, check_layout(lay, ms)))
         cands.sort(key=Candidate.sort_key)
         if cands[0].checks.verdict != "pass":
@@ -2339,7 +2597,7 @@ def compose_format(
             cands = []
     if not cands:
         for k in range(brief.candidates):
-            lay = build_layout(brief, sprites, fmt, brief.seed + k, ms)
+            lay = build(k, None)
             cands.append(Candidate(brief.seed + k, lay, check_layout(lay, ms)))
     for c in cands:
         c.layout.worn_candidates = worn_candidates
@@ -2517,12 +2775,27 @@ def compose_brief(
 ) -> list[FormatResult]:
     out_dir.mkdir(parents=True, exist_ok=True)
     cutter_get = _lazy(cutter_factory or _default_cutter)
+    is_single = brief.layout == ad_single.LAYOUT_NAME
     sprites, dropped = prepare_sprites(
-        brief, cache_dir, cutter_factory=cutter_get, fetch=fetch, base_dir=base_dir, log=log
+        brief,
+        cache_dir,
+        cutter_factory=cutter_get,
+        fetch=fetch,
+        base_dir=base_dir,
+        log=log,
+        min_items=1 if is_single else MIN_ITEMS,
     )
     worn, worn_candidates, notes = prepare_worn(brief, sprites, cache_dir, cutter_get, fetch, log)
     for n in notes:
         log(f"  {n}")
+    details = []
+    if is_single and brief.items and len(brief.items[0].images) >= 2:
+        try:  # 細部の写真は「あれば」。選べなくても1点ものは組める
+            details = ad_single.prepare_details(
+                brief.items[0].images, brief.items[0].image, cache_dir, cutter_get, fetch, log=log
+            )
+        except Exception as e:
+            log(f"  細部の写真を選べなかった: {type(e).__name__}: {e}")
     results = []
     for fmt in formats:
         fr = compose_format(
@@ -2538,6 +2811,7 @@ def compose_brief(
             log=log,
             worn=worn,
             worn_candidates=worn_candidates,
+            details=details,
         )
         log(
             f"  {brief.orig_id or brief.id} {fmt}: {fr.verdict} 点{fr.best.checks.score}"

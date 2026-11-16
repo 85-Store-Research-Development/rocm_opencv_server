@@ -693,3 +693,42 @@ def test_run_briefs_continues_after_a_failure(tmp_path, monkeypatch, crm):
     posts = [r for r in FakeCrm.received if r[0] == "POST"]
     assert [p[1] for p in posts] == ["/api/ads/briefs/11/creatives"]
     assert posts[0][2]["meta"]["revision"] == 2
+
+
+# ------------------------------------------------------------ 9:16 を縦に使う・キャッシュの版
+
+
+def test_spread_vertically_fills_the_region():
+    ms = ac.Measurer(None)
+    b = ac.parse_brief(brief_raw(4))
+    lay = ac.build_layout(b, sprites(4), "9:16", 0, ms)
+    _, y0, _, y1 = lay.region
+    top = min(it.cy - it.half_extent()[1] for it in lay.items)
+    bottom = max(it.cy + it.half_extent()[1] for it in lay.items)
+    assert (bottom - top) >= 0.85 * (y1 - y0)
+
+
+def test_score_penalizes_lopsided_vertical_use_for_tall_formats():
+    ms = ac.Measurer(None)
+    lay = ac.build_layout(ac.parse_brief(brief_raw(3)), sprites(3), "9:16", 0, ms)
+    good = ac.check_layout(lay, ms)
+    assert good.score_parts["use"] >= 0.9 and good.score_parts["vbalance"] >= 0.8
+    for it in lay.items:  # 全部を範囲の上へ寄せる
+        it.cy = lay.region[1] + it.half_extent()[1] + 5
+    bad = ac.check_layout(lay, ms)
+    assert bad.score_parts["vbalance"] < good.score_parts["vbalance"]
+    assert bad.score < good.score
+
+
+def test_aside_does_not_touch_a_longer_second_headline_line():
+    b = ac.parse_brief(brief_raw(headline="あ\nあいうえおかきくけ"))
+    fixed = ac.layout_fixed(b, "9:16", ac.Measurer(None))
+    aside = next(x for x in fixed.blocks if x.name == "aside").mask((1080, 1920))
+    head = next(x for x in fixed.blocks if x.name == "headline").mask((1080, 1920))
+    assert not (aside & head).any()
+
+
+def test_cache_key_changes_with_cutout_rules_version(monkeypatch):
+    a = ac.cache_key("u", None, "Shirts")
+    monkeypatch.setattr(ac, "CUTOUT_CACHE_VERSION", ac.CUTOUT_CACHE_VERSION + 1)
+    assert ac.cache_key("u", None, "Shirts") != a

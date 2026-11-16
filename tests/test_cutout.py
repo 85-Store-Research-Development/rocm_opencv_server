@@ -97,8 +97,52 @@ def test_finish_fail_returns_no_image():
     assert res.status == "fail" and res.rgba is None
 
 
+def photo(garment, wall, box=(50, 30, 150, 170), size=200):
+    arr = np.full((size, size, 3), wall, np.uint8)
+    x0, y0, x1, y1 = box
+    arr[y0:y1, x0:x1] = garment
+    return Image.fromarray(arr)
+
+
+def test_edge_contrast_is_small_for_white_on_white_and_large_for_dark():
+    m = blob(box=(50, 30, 150, 170))
+    weak = cutout.edge_contrast_top(cutout.lab_image(photo((245, 245, 245), (235, 235, 235))), m)
+    strong = cutout.edge_contrast_top(cutout.lab_image(photo((30, 30, 30), (220, 220, 220))), m)
+    assert weak < cutout.EDGE_DELTA_CHECK < strong
+    assert (
+        cutout.edge_contrast_top(
+            cutout.lab_image(photo((0, 0, 0), (0, 0, 0))), np.zeros((200, 200), bool)
+        )
+        == cutout.NO_EDGE_DELTA
+    )
+
+
+def test_top_roughness_is_larger_for_a_notched_collar():
+    smooth = blob(h=300, w=300, box=(50, 50, 250, 250))
+    ragged = smooth.copy()
+    for x in range(100, 200, 14):  # 襟元のギザギザの欠け
+        ragged[50:75, x : x + 7] = False
+    assert cutout.top_roughness(ragged) > cutout.ROUGH_CHECK > cutout.top_roughness(smooth)
+
+
+def test_grade_checks_weak_edge_and_rough_top():
+    base = cutout.Quality(area_ratio=0.3, touches_border=False, components=1, box_score=0.8)
+    assert cutout.grade(base)[0] == "ok"
+    weak = cutout.Quality(0.3, False, 1, 0.8, edge_delta=10.0)
+    status, reasons = cutout.grade(weak)
+    assert status == "check" and "境目が弱い" in reasons[0]
+    rough = cutout.Quality(0.3, False, 1, 0.8, roughness=0.004)
+    assert cutout.grade(rough)[0] == "check"
+
+
+def test_finish_white_on_white_is_check_not_ok():
+    img = photo(garment=(245, 245, 245), wall=(235, 235, 235))
+    res = cutout.finish(img, blob(box=(50, 30, 150, 170)), 0.8)
+    assert res.status == "check" and res.rgba is not None
+
+
 def test_finish_ok_returns_cropped_rgba():
-    img = Image.new("RGB", (200, 200), (120, 120, 120))
+    img = photo(garment=(30, 30, 30), wall=(200, 200, 200))
     res = cutout.finish(img, blob(box=(50, 30, 150, 170)), 0.8)
     assert res.status == "ok"
     assert res.rgba.mode == "RGBA" and res.rgba.width < 200

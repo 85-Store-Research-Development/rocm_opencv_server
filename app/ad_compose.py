@@ -73,7 +73,8 @@ ITEM_EDGE_RATIO = 0.03  # 商品が画面の端から離れる最小（幅に対
 ANGLE_MAX = 10.0
 ANGLE_MIN = 3.0
 FILL_RATIO = 0.64  # 商品の外接矩形の合計が、置ける範囲に占める割合のめやす
-FILL_RATIO_TALL = 0.88  # 縦長（9:16）は商品を大きめにして縦に広く使う
+USE_TARGET = 0.9  # 商品の縦の広がりが、置ける範囲の高さのこの割合以上なら満点
+FILL_RATIO_TALL = 0.95  # 縦長（9:16）は商品を大きめにして縦に広く使う
 MAX_ITEM_H_OF_REGION = 0.6
 MAX_ITEM_W_OF_REGION = 0.65
 ELLIPSE_FACTOR = 0.85  # 商品どうしの離し方に使う楕円の大きさ（外接矩形に対して）
@@ -793,7 +794,7 @@ def layout_fixed(brief: Brief, fmt: str, ms: Measurer) -> Fixed:
             pp = probe.polygon()
             box = (pp[:, 0].min(), pp[:, 1].min(), pp[:, 0].max(), pp[:, 1].max())
             if not any(
-                box[0] < r[2] + 20 and box[2] > r[0] and box[1] < r[3] and box[3] > r[1]
+                box[0] < r[2] + 20 and box[2] > r[0] - 8 and box[1] < r[3] + 8 and box[3] > r[1] - 8
                 for r in line_rects
             ):
                 asz, ay, beside = cand, probe.y, True
@@ -853,6 +854,8 @@ class Sprite:
 
 
 ALPHA_MAX_H = 700
+# 切り抜きの判定の規則を変えたら上げる（古い判定のキャッシュを使わない）
+CUTOUT_CACHE_VERSION = 2
 
 
 def sprite_from_png(item: BriefItem, png: Path) -> Sprite:
@@ -878,6 +881,7 @@ def default_fetch(src: str) -> bytes:
 
 def cache_key(src: str, data: bytes | None, item_type: str | None) -> str:
     h = hashlib.sha1()
+    h.update(f"v{CUTOUT_CACHE_VERSION}:".encode())
     h.update((item_type or "").encode())
     h.update(b"\0")
     h.update(data if data is not None else src.encode())
@@ -1039,6 +1043,20 @@ def clamp_item(it: ItemState, region: tuple) -> None:
     x0, y0, x1, y1 = region
     it.cx = min(max(it.cx, x0 + hx), max(x0 + hx, x1 - hx))
     it.cy = min(max(it.cy, y0 + hy), max(y0 + hy, y1 - hy))
+
+
+def spread_vertically(items: list[ItemState], region: tuple) -> None:
+    """縦長の範囲では、商品の並びを縦に引き伸ばして、範囲の上から下までいっぱいに使う。"""
+    x0, y0, x1, y1 = region
+    tops = min(it.cy - it.half_extent()[1] for it in items)
+    bottoms = max(it.cy + it.half_extent()[1] for it in items)
+    if bottoms - tops < 1 or bottoms - tops >= y1 - y0:
+        return
+    k = (y1 - y0) / (bottoms - tops)
+    for it in items:
+        it.cy = y0 + (it.cy - tops) * k + 0.0
+    for it in items:
+        clamp_item(it, region)
 
 
 def relax(items: list[ItemState], region: tuple) -> None:
@@ -1350,6 +1368,9 @@ def build_layout(brief: Brief, sprites: list[Sprite], fmt: str, seed: int, ms: M
         rng = random.Random(f"{seed}:{attempt}")
         items = make_items(sprites, fixed.region, rng, scale)
         relax(items, fixed.region)
+        if fixed.region[3] - fixed.region[1] > 1.15 * (fixed.region[2] - fixed.region[0]):
+            spread_vertically(items, fixed.region)
+            relax(items, fixed.region)
         steps = LABEL_STEPS if attempt == ATTEMPTS else LABEL_STEPS[:1]
         ok, cost = place_texts(items, fixed, geo, ms, rng, steps)
         unplaced = sum(1 for it in items if not it.placed)
@@ -1502,7 +1523,10 @@ def check_layout(lay: Layout, ms: Measurer | None = None) -> Checks:
 
 
 def score_layout(lay: Layout, union: np.ndarray) -> tuple[float, dict]:
-    """点数（0〜100）。余白のつり合い・商品の大きさのばらつき・埋まり具合。簡単な目安。"""
+    """点数（0〜100）。余白のつり合い・商品の大きさのばらつき・埋まり具合・縦の使い切り。簡単な目安。
+
+    use = 商品が置ける範囲の高さに占める、商品の縦の広がりの割合。縦長（9:16）では大きな空きが
+    片側に残る候補（上下の空きの偏り）を選ばないよう、重みを大きくする。"""
     x0, y0, x1, y1 = lay.region
     rw, rh = x1 - x0, y1 - y0
     ys, xs = np.where(union)
@@ -1520,14 +1544,24 @@ def score_layout(lay: Layout, union: np.ndarray) -> tuple[float, dict]:
         np.mean([upside_fraction(it.arc) for it in lay.items if it.arc is not None] or [0.0])
     )
     readable = 1 - upside
+    tall = rh > 1.15 * rw
+    use = min(1.0, float(ys.max() - ys.min()) / (rh * USE_TARGET))
+    vbal = max(0.0, 1 - abs(mt - mb) / (0.25 * rh))  # 上下の空きの差が範囲の 1/4 なら 0
     parts = {
         "balance": round(balance, 3),
         "variety": round(variety, 3),
         "fill": round(fill, 3),
         "readable": round(readable, 3),
+        "use": round(use, 3),
+        "vbalance": round(vbal, 3),
         "cover": round(cover, 3),
     }
-    score = 100 * (0.35 * balance + 0.2 * variety + 0.3 * fill + 0.15 * readable)
+    if tall:
+        score = 100 * (
+            0.2 * balance + 0.1 * variety + 0.2 * fill + 0.1 * readable + 0.2 * use + 0.2 * vbal
+        )
+    else:
+        score = 100 * (0.35 * balance + 0.2 * variety + 0.3 * fill + 0.15 * readable)
     return round(score, 1), parts
 
 

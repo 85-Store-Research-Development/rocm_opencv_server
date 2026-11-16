@@ -445,3 +445,16 @@ def test_collage_meta_has_no_layout_key():
     cand = ac.Candidate(0, lay, ac.check_layout(lay, MS))
     fr = ac.FormatResult("4:5", "pass", cand, [cand], [], Path("x.png"), Path("x.json"), 0.0, [])
     assert "layout" not in fr.meta() and "callouts_placed" not in fr.meta()
+
+
+def test_layout_collage_and_extra_keys_are_the_classic_collage():
+    items = [dict(single_raw()["items"][0], id=f"i{k}") for k in range(3)]
+    for lay in ("collage", None, "unknown"):
+        raw = {**single_raw(), "items": items, "theme": "特集", "angle": "weekly"}
+        raw["layout"] = lay
+        brief = ac.parse_brief(raw)  # theme など知らないキーは読まない
+        assert brief.layout == "collage" and brief.single is None and len(brief.items) == 3
+        sprites = [
+            ac.Sprite(f"i{k}", f"ラベル{k}", Path("/x.png"), hero_sprite().alpha) for k in range(3)
+        ]
+        assert ac.build_layout(brief, sprites, "4:5", 0, MS).layout == "collage"

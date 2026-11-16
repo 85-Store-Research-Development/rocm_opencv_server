@@ -30,12 +30,32 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageFont
+
+from app import ad_season
+from app.ad_palette import (  # noqa: F401  色の部品（テスト・外からも ad_compose 経由で使える）
+    DEFAULT_PALETTE,
+    MIN_CONTRAST,
+    PALETTE_NAMES,
+    PALETTES,
+    Palette,
+    choose_palette,
+    contrast_ratio,
+    contrast_score,
+    glow_color,
+    item_lightness,
+    luminance,
+    palette_family,
+    sinks,
+    tone_hist,
+)
+from app.ad_palette import GLOW_BLUR as _GLOW_BLUR
+from app.ad_season import Season, parse_season
 
 # ---------------------------------------------------------------- 定数
 
@@ -96,12 +116,17 @@ CONCAVE_FREE = 0.06  # 1歩あたりこの角度までの曲がりは許す
 # 検査のしきい値
 TOLERANCE_PX = 40  # 重なりの許容（アンチエイリアスの分）
 MAX_ITEM_OVERLAP = 0.12  # 商品どうしの重なり（小さいほうの面積に対する割合）
+CONTRAST_WEIGHT = 0.1  # 点数に占める「商品と地の明暗の差」の割合
 MIN_ITEM_H_RATIO = 0.18  # 商品の高さの下限（幅に対する割合）
 ITEM_OUTSIDE_RATIO = 0.01  # 商品が画面の端の余白から出てよい割合（商品の面積に対して）
 
 # 落書き
 DOODLE_COUNT = (3, 5)
 DOODLE_SIZE = (80, 120)
+DOODLE_ROT = 25.0  # 汎用の落書きを傾ける角度の上限（±度）
+SEASON_DOODLE_COUNT = (5, 7)  # 季節があるとき（季節の落書きが主）
+SEASON_GENERIC_MAX = 2  # そのうち汎用の落書き（星・波・矢印…）は多くてもこれだけ
+SEASON_DOODLE_SIZE = (84, 150)  # 大きさにばらつきを付ける
 DOODLE_STROKE = 4
 DOODLE_CLEAR = 18  # 落書きと商品・文字の間に空ける
 DOODLE_TRIES = 400
@@ -115,26 +140,6 @@ CHROME_ARGS = (
     "--virtual-time-budget=4000",
 )
 
-
-@dataclass(frozen=True)
-class Palette:
-    bg: str
-    text: str
-    accent: str
-    doodle: str
-    shadow: str
-
-
-# 色はパレットの中だけ。濃い地には白に近い文字（明暗比 4.5:1 以上をテストで確かめる）
-PALETTES = {
-    "navy": Palette("#16335A", "#FFFFFF", "#F5D547", "#FFFFFF", "rgba(0,0,0,.35)"),
-    "brown": Palette("#3B2A1F", "#FFF6E8", "#F2B84B", "#FFF6E8", "rgba(0,0,0,.38)"),
-    "burgundy": Palette("#5C1A2E", "#FFF3EE", "#F7C85A", "#FFF3EE", "rgba(0,0,0,.38)"),
-    "green": Palette("#1D4A38", "#FFFFFF", "#F5D547", "#FFFFFF", "rgba(0,0,0,.35)"),
-    "paper": Palette("#F3EEDF", "#1B1A18", "#C0391B", "#1B1A18", "rgba(40,30,20,.24)"),
-}
-DEFAULT_PALETTE = "navy"
-MIN_CONTRAST = 4.5
 
 FONT_FILES = {"dm": "DMSans.ttf", "caveat": "Caveat.ttf", "yomogi": "Yomogi.ttf"}
 FONT_OPTIONAL = ("DMSans-Italic.ttf", "ZenKurenaido.ttf", "Gaegu-Bold.ttf")
@@ -158,28 +163,6 @@ class CannotCompose(RuntimeError):
     """切り抜けた商品が足りないなど、作れないとき。"""
 
 
-# ---------------------------------------------------------------- 色
-
-
-def _rgb(hexcolor: str) -> tuple[float, float, float]:
-    h = hexcolor.lstrip("#")
-    return tuple(int(h[i : i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
-
-
-def luminance(hexcolor: str) -> float:
-    def lin(c: float) -> float:
-        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
-
-    r, g, b = (lin(c) for c in _rgb(hexcolor))
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-
-def contrast_ratio(a: str, b: str) -> float:
-    la, lb = luminance(a), luminance(b)
-    hi, lo = max(la, lb), min(la, lb)
-    return (hi + 0.05) / (lo + 0.05)
-
-
 # ---------------------------------------------------------------- ブリーフ
 
 
@@ -190,6 +173,7 @@ class BriefItem:
     label: str
     item_type: str | None = None
     cutout: str | None = None  # 切り抜き済みの RGBA PNG があればそれを使う
+    tone: str | None = None  # dark / mid / light（任意。画素から測れないときの手がかり）
 
 
 @dataclass
@@ -210,6 +194,10 @@ class Brief:
     )
     revision: object = None  # CRM が古い版を見分けるための版（そのまま返す）
     formats: list[str] = field(default_factory=list)  # ブリーフが望む形式（引数が無いとき使う）
+    season: Season | None = None  # 無い・知らない motif は None（季節なし。今までの見た目）
+    palette_options: list[str] = field(default_factory=list)  # 沈むとき替えてよい色（任意）
+    palette_requested: str = ""  # ブリーフの palette（palette は実際に使う色）
+    palette_changed_reason: str | None = None
 
 
 _ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -315,13 +303,27 @@ def parse_brief(raw: dict) -> Brief:
             problems.append(f"items[{i}].image が必要です")
         label = _text(problems, f"items[{i}].label", it.get("label"), required=True, maxlen=60)
         itype = it.get("item_type")
+        tone = it.get("tone")
         items.append(
-            BriefItem(iid, image, label, itype if isinstance(itype, str) else None, cut or None)
+            BriefItem(
+                iid,
+                image,
+                label,
+                itype if isinstance(itype, str) else None,
+                cut or None,
+                tone if tone in ("dark", "mid", "light") else None,
+            )
         )
     if problems:
         raise BriefError(problems)
     wanted = raw.get("formats")
     formats = [f for f in wanted if f in FORMATS] if isinstance(wanted, list) else []
+    opts = raw.get("palette_options")
+    options = (
+        [o for o in dict.fromkeys(opts) if isinstance(o, str) and o in PALETTES]
+        if isinstance(opts, list)
+        else []
+    )
     return Brief(
         safe_id(bid),
         fmt,
@@ -337,6 +339,9 @@ def parse_brief(raw: dict) -> Brief:
         orig_id=bid,
         revision=raw.get("revision"),
         formats=formats,
+        season=parse_season(raw.get("season")),
+        palette_options=options,
+        palette_requested=palette,
     )
 
 
@@ -704,6 +709,32 @@ class Fixed:
     notes: list[str] = field(default_factory=list)
 
 
+STAMP_SIZE = SCALE[0] - 2  # 季節のスタンプの文字の大きさ
+STAMP_ANGLE = -4.0
+STAMP_GAP = 30  # 店名・地域の行との間
+STAMP_TOP_DROP = 4  # 傾けた角が安全域の上へ出ないよう、行の上端より少し下げる
+
+
+def place_stamp(season: Season | None, blocks: list[Block], geo: Geo, ms: Measurer) -> Block | None:
+    """季節の一言（例「NOVEMBER / 晩秋」）の小さなスタンプ。店名の行の、店名のすぐ右に置く
+    （地域の行にぶつかるなら置かない）。手描きの楕円の枠と少しの傾きは描画側。"""
+    if season is None or not season.stamp:
+        return None
+    tw = ms.width("store", season.stamp, STAMP_SIZE)
+    rx, ry = tw / 2 * 1.28 + 12, STAMP_SIZE * 0.85
+    w, h = 2 * rx, 2 * ry
+    store = next((b for b in blocks if b.name == "store"), None)
+    area = next((b for b in blocks if b.name == "area"), None)
+    x = (store.x + store.w + STAMP_GAP) if store else geo.mx
+    y = geo.safe_top + STAMP_TOP_DROP
+    limit = (area.x - STAMP_GAP) if area else geo.w - geo.mx
+    if x + w > limit:
+        return None
+    return Block(
+        "stamp", [season.stamp], "store", STAMP_SIZE, x, y, w, h, angle=STAMP_ANGLE, align="center"
+    )
+
+
 def layout_fixed(brief: Brief, fmt: str, ms: Measurer) -> Fixed:
     geo = geometry(fmt)
     W, H, mx = geo.w, geo.h, geo.mx
@@ -738,6 +769,11 @@ def layout_fixed(brief: Brief, fmt: str, ms: Measurer) -> Fixed:
                 align="right",
             )
         )
+    stamp = place_stamp(brief.season, blocks, geo, ms)
+    if brief.season and brief.season.stamp and stamp is None:
+        notes.append("季節のスタンプを置く場所が無い")
+    if stamp is not None:
+        blocks.append(stamp)
     # 見出し: 大きい段から、いちばん長い行が収まるものを選ぶ
     lines = list(brief.headline)
     steps = HEADLINE_STEPS[fmt]
@@ -851,6 +887,13 @@ class Sprite:
     png_path: Path
     alpha: np.ndarray  # 元の切り抜きのアルファ（高さを ALPHA_MAX_H までに縮めたもの）
     item_type: str | None = None
+    hist: np.ndarray | None = None  # アルファで重み付けした L* の分布（画素から測れたとき）
+    tone_hint: str | None = None  # ブリーフの tone（画素から測れないときの手がかり）
+
+    @property
+    def light(self) -> float | None:
+        """商品の明るさ（L*。0〜100）。測れなければ tone の目安、それも無ければ None。"""
+        return item_lightness(self.hist, self.tone_hint)
 
 
 ALPHA_MAX_H = 700
@@ -858,14 +901,33 @@ ALPHA_MAX_H = 700
 CUTOUT_CACHE_VERSION = 4
 
 
+TONE_MAX_H = 300  # 明るさを測るときに縮める高さ
+
+
 def sprite_from_png(item: BriefItem, png: Path) -> Sprite:
-    alpha = np.asarray(Image.open(png).convert("RGBA").getchannel("A"))
+    rgba = np.asarray(Image.open(png).convert("RGBA"))
+    alpha = np.ascontiguousarray(rgba[..., 3])
+    small = rgba
+    if small.shape[0] > TONE_MAX_H:
+        s = TONE_MAX_H / small.shape[0]
+        small = cv2.resize(
+            small, (max(1, round(small.shape[1] * s)), TONE_MAX_H), interpolation=cv2.INTER_AREA
+        )
+    hist = tone_hist(small[..., :3], small[..., 3])
     if alpha.shape[0] > ALPHA_MAX_H:
         s = ALPHA_MAX_H / alpha.shape[0]
         alpha = cv2.resize(
             alpha, (max(1, round(alpha.shape[1] * s)), ALPHA_MAX_H), interpolation=cv2.INTER_AREA
         )
-    return Sprite(item.id, item.label, png, np.ascontiguousarray(alpha), item.item_type)
+    return Sprite(
+        item.id,
+        item.label,
+        png,
+        np.ascontiguousarray(alpha),
+        item.item_type,
+        hist if hist.sum() > 0 else None,
+        item.tone,
+    )
 
 
 def default_fetch(src: str) -> bytes:
@@ -979,6 +1041,7 @@ class ItemState:
     text_len: float = 0.0
     cost: float = 0.0
     placed: bool = False
+    glow: bool = False  # 地に沈むので、縁にやわらかい光の縁取りを足す（画素は変えない）
 
     def __post_init__(self):
         self.w = self.sprite.alpha.shape[1] * self.h / self.sprite.alpha.shape[0]
@@ -1238,6 +1301,14 @@ DOODLES = {
 }
 
 
+def shape_spec(kind: str) -> ad_season.Shape:
+    """落書きの形。汎用（星・波・渦・矢印）は線だけ、季節の物は app/ad_season.py の形。"""
+    if kind in ad_season.SHAPES:
+        return ad_season.SHAPES[kind]
+    path, bw, bh = DOODLES[kind]
+    return ad_season.Shape(((path, "s"),), bw, bh, DOODLE_ROT)
+
+
 @dataclass
 class Doodle:
     kind: str
@@ -1247,17 +1318,41 @@ class Doodle:
     angle: float
 
     def polygon(self, pad: float = 0.0) -> np.ndarray:
-        _, bw, bh = DOODLES[self.kind]
+        sp = shape_spec(self.kind)
         k = self.size / 100
         return rect_polygon(
-            self.cx - bw * k / 2, self.cy - bh * k / 2, bw * k, bh * k, self.angle, pad
+            self.cx - sp.w * k / 2, self.cy - sp.h * k / 2, sp.w * k, sp.h * k, self.angle, pad
         )
 
 
+def doodle_sequence(rng: random.Random, season: Season | None) -> tuple[list[str], int]:
+    """置く落書きの種類の並び（先頭から置けた分だけ使う）と、置く数。季節があれば季節の物が主。"""
+    generic = list(DOODLES)
+    if season is None:
+        rng.shuffle(generic)
+        return generic * 2, rng.randint(*DOODLE_COUNT)
+    own = list(ad_season.doodle_kinds(season))
+    rng.shuffle(own)
+    rng.shuffle(generic)
+    want = rng.randint(*SEASON_DOODLE_COUNT)
+    seq: list[str] = []
+    for _ in range(want * 3):  # 置けない物があるぶん多めに並べる
+        pool = own if (rng.random() < ad_season.SEASON_SHARE and own) else generic
+        k = pool.pop(0)
+        pool.append(k)  # 一巡するまで同じ物を重ねない
+        seq.append(k)
+    return seq, want
+
+
 def place_doodles(
-    rng: random.Random, geo: Geo, occupied: np.ndarray, region: tuple
+    rng: random.Random,
+    geo: Geo,
+    occupied: np.ndarray,
+    region: tuple,
+    season: Season | None = None,
 ) -> list[Doodle]:
-    """空いている所に、種から選んだ数と種類の落書きを置く（占有マップで空きを探す）。"""
+    """空いている所に、種から選んだ数と種類の落書きを置く（占有マップで空きを探す）。
+    季節があれば季節の落書きが主（汎用の星・波・矢印も混ぜる）。大きさと傾きにばらつきを付ける。"""
     size = (geo.w, geo.h)
     d = int(DOODLE_CLEAR * 2 + 1)
     blocked = cv2.dilate(
@@ -1265,20 +1360,26 @@ def place_doodles(
     ).astype(bool)
     sx0, sy0, sx1, sy1 = geo.safe_rect
     x0, y0, x1, y1 = region
-    kinds = list(DOODLES)
-    rng.shuffle(kinds)
-    want = rng.randint(*DOODLE_COUNT)
+    kinds, want = doodle_sequence(rng, season)
+    size_range = SEASON_DOODLE_SIZE if season else DOODLE_SIZE
     out: list[Doodle] = []
-    for kind in kinds * 2:
+    for kind in kinds:
         if len(out) >= want:
             break
+        if (
+            season
+            and kind in DOODLES
+            and sum(1 for o in out if o.kind in DOODLES) >= SEASON_GENERIC_MAX
+        ):
+            continue
+        rot_max = shape_spec(kind).rot if season else DOODLE_ROT
         for _ in range(DOODLE_TRIES // 4):
             dd = Doodle(
                 kind,
                 rng.uniform(sx0, sx1),
                 rng.uniform(max(sy0, y0 - 60), min(sy1, y1 + 40)),
-                rng.uniform(*DOODLE_SIZE) * geo.w / 1080,
-                rng.uniform(-25, 25),
+                rng.uniform(*size_range) * geo.w / 1080,
+                rng.uniform(-rot_max, rot_max),
             )
             poly = dd.polygon(pad=4)
             if (
@@ -1321,6 +1422,9 @@ class Layout:
     notes: list[str] = field(default_factory=list)
     attempts: int = 1
     scale: float = 1.0
+    palette_requested: str = ""
+    palette_changed_reason: str | None = None
+    season: Season | None = None
 
     def to_json(self) -> dict:
         items = []
@@ -1334,6 +1438,8 @@ class Layout:
                     "w": round(it.w, 1),
                     "h": round(it.h, 1),
                     "angle": round(it.angle, 2),
+                    "light": None if it.sprite.light is None else round(it.sprite.light, 1),
+                    "glow": it.glow,
                     "label_size": it.fs,
                     "text_placed": it.placed,
                     "text_len": round(it.text_len, 1),
@@ -1346,6 +1452,10 @@ class Layout:
             "size": [self.w, self.h],
             "seed": self.seed,
             "palette": self.palette,
+            "palette_used": self.palette,
+            "palette_requested": self.palette_requested or self.palette,
+            "palette_changed_reason": self.palette_changed_reason,
+            "season": None if self.season is None else self.season.to_json(),
             "region": [round(v, 1) for v in self.region],
             "blocks": [b.to_json() for b in self.blocks],
             "items": items,
@@ -1374,6 +1484,9 @@ def build_layout(brief: Brief, sprites: list[Sprite], fmt: str, seed: int, ms: M
         steps = LABEL_STEPS if attempt == ATTEMPTS else LABEL_STEPS[:1]
         ok, cost = place_texts(items, fixed, geo, ms, rng, steps)
         unplaced = sum(1 for it in items if not it.placed)
+        bg = PALETTES[brief.palette].bg
+        for it in items:
+            it.glow = sinks(it.sprite.light, bg)
         lay = Layout(
             fmt,
             geo.w,
@@ -1387,6 +1500,9 @@ def build_layout(brief: Brief, sprites: list[Sprite], fmt: str, seed: int, ms: M
             list(fixed.notes),
             attempt,
             scale,
+            brief.palette_requested or brief.palette,
+            brief.palette_changed_reason,
+            brief.season,
         )
         rank = unplaced * 1e6 + cost
         if best is None or rank < best[0]:
@@ -1402,7 +1518,7 @@ def build_layout(brief: Brief, sprites: list[Sprite], fmt: str, seed: int, ms: M
         occ |= it.mask((geo.w, geo.h))
         if it.arc is not None:
             raster_band(it.arc[: max(2, int(it.text_len / CONTOUR_STEP) + 1)], it.fs).paint(occ)
-    lay.doodles = place_doodles(random.Random(f"{seed}:doodle"), geo, occ, lay.region)
+    lay.doodles = place_doodles(random.Random(f"{seed}:doodle"), geo, occ, lay.region, brief.season)
     return lay
 
 
@@ -1562,6 +1678,16 @@ def score_layout(lay: Layout, union: np.ndarray) -> tuple[float, dict]:
         )
     else:
         score = 100 * (0.35 * balance + 0.2 * variety + 0.3 * fill + 0.15 * readable)
+    # 商品と地の明暗の差（沈んだ商品が多いほど下がる。光の縁取りで救った分は最低 0.6）。
+    # 画素もブリーフの tone も無く測れないときは混ぜない（従来の点数のまま）
+    contrast = contrast_score(
+        [it.sprite.light for it in lay.items],
+        PALETTES[lay.palette].bg,
+        [it.glow for it in lay.items],
+    )
+    if contrast is not None:
+        parts["contrast"] = round(contrast, 3)
+        score = (1 - CONTRAST_WEIGHT) * score + 100 * CONTRAST_WEIGHT * contrast
     return round(score, 1), parts
 
 
@@ -1595,6 +1721,18 @@ def _wave_path(x: float, y: float, w: float) -> str:
     return d
 
 
+def stamp_frame_d(rx: float, ry: float, seed_text: str) -> str:
+    """スタンプの手描きの楕円の枠。少しゆらし、終わりを始めより先へ重ねる（同じ文字なら同じ形）。"""
+    rnd = random.Random(seed_text)
+    n = 36
+    pts = []
+    for i in range(n + 3):  # 1周より少し先まで（ペンの重なり）
+        a = 2 * math.pi * i / n - math.pi / 2
+        j = 1 + rnd.uniform(-0.02, 0.02) + 0.03 * (i / n)
+        pts.append((rx * j * math.cos(a), ry * j * math.sin(a)))
+    return ad_season.smooth(pts)
+
+
 def arc_path_d(arc: np.ndarray) -> str:
     return "M" + " L".join(f"{x:.1f} {y:.1f}" for x, y in arc)
 
@@ -1620,17 +1758,32 @@ filter:drop-shadow(0 14px 16px {pal.shadow})}}
 svg.ov{{position:absolute;left:0;top:0;pointer-events:none;overflow:visible}}
 svg.ov .d{{fill:none;stroke:{pal.doodle};stroke-width:{DOODLE_STROKE};stroke-linecap:round;
 stroke-linejoin:round;vector-effect:non-scaling-stroke}}
+svg.ov .da{{fill:{pal.accent};stroke:{pal.doodle};stroke-width:{DOODLE_STROKE};
+stroke-linejoin:round;vector-effect:non-scaling-stroke}}
+svg.ov .stamp{{fill:none;stroke:{pal.accent};stroke-width:3;stroke-linecap:round;
+vector-effect:non-scaling-stroke}}
+svg.ov text.stampt{{fill:{pal.text};font-family:"DM Sans","Noto Sans CJK JP",sans-serif;
+font-weight:700;letter-spacing:.1em;text-anchor:middle}}
 svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;letter-spacing:.03em}}
 .acc{{color:{pal.accent}}}
 """
     body: list[str] = []
+    glow = glow_color(pal)
     for it in lay.items:
+        # 沈む商品だけ、地よりわずかに明るい（明るい地では暗い）やわらかい光の縁取りを足す。
+        # 商品の画素は変えない（周りに光を足すだけ）
+        img_style = ""
+        if it.glow:
+            blur = " ".join(f"drop-shadow(0 0 {r}px {glow})" for r in _GLOW_BLUR)
+            img_style = f' style="filter:{blur} drop-shadow(0 14px 16px {pal.shadow})"'
         body.append(
             f'<div class="it" style="left:{it.cx - it.w / 2:.1f}px;top:{it.cy - it.h / 2:.1f}px;'
             f'width:{it.w:.1f}px;height:{it.h:.1f}px;transform:rotate({it.angle:.2f}deg)">'
-            f'<img src="{it.sprite.png_path.resolve().as_uri()}"></div>'
+            f'<img src="{it.sprite.png_path.resolve().as_uri()}"{img_style}></div>'
         )
     for b in lay.blocks:
+        if b.name == "stamp":
+            continue  # SVG の側で描く（枠つき）
         cls = {
             "store": "store",
             "area": "area",
@@ -1658,12 +1811,24 @@ svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;lette
         body.append(f'<div class="b {cls}" style="{style}">{inner}</div>')
     svg = [f'<svg class="ov" width="{W}" height="{H}" viewBox="0 0 {W} {H}">']
     for d in lay.doodles:
-        path = DOODLES[d.kind][0]
         k = d.size / 100
+        layers = "".join(
+            f'<path class="{"da" if mode == "a" else "d"}" d="{path}"/>'
+            for path, mode in shape_spec(d.kind).layers
+        )
         svg.append(
             f'<g transform="translate({d.cx:.1f} {d.cy:.1f}) rotate({d.angle:.1f}) '
-            f'scale({k:.3f})"><path class="d" d="{path}"/></g>'
+            f'scale({k:.3f})">{layers}</g>'
         )
+    for b in lay.blocks:
+        if b.name == "stamp":
+            cx, cy = b.x + b.w / 2, b.y + b.h / 2
+            svg.append(
+                f'<g transform="translate({cx:.1f} {cy:.1f}) rotate({b.angle:.1f})">'
+                f'<path class="stamp" d="{stamp_frame_d(b.w / 2, b.h / 2, b.lines[0])}"/>'
+                f'<text class="stampt" y="{b.size * 0.36:.1f}" font-size="{b.size}">'
+                f"{e(b.lines[0])}</text></g>"
+            )
     for b in lay.blocks:
         if b.underline:
             svg.append(f'<path class="d" d="{_wave_path(b.x, b.y + b.h - 6, b.w)}"/>')
@@ -1758,9 +1923,12 @@ class FormatResult:
     def meta(self) -> dict:
         """CRM へ返す meta（format・seed・score・verdict・checks・dropped_items・revision）。"""
         extra = {} if self.revision is None else {"revision": self.revision}
+        lay = self.best.layout
         return {
             **extra,
             "format": self.format,
+            "palette_used": lay.palette,
+            "palette_changed_reason": lay.palette_changed_reason,
             "seed": self.best.seed,
             "score": self.best.checks.score,
             "verdict": self.verdict,
@@ -1789,6 +1957,15 @@ def compose_format(
 ) -> FormatResult:
     t0 = time.time()
     ms = Measurer(fonts_dir)
+    # 地に沈む商品があれば、先に色を決める（色は候補ごとに変えない。同じ版の 3 形式で揃う）
+    used, reason = choose_palette(
+        brief.palette, [sp.light for sp in sprites], brief.palette_options or None
+    )
+    if used != brief.palette:
+        log(f"  色を替えた: {reason}")
+        brief = replace(
+            brief, palette=used, palette_requested=brief.palette, palette_changed_reason=reason
+        )
     cands = []
     for k in range(brief.candidates):
         lay = build_layout(brief, sprites, fmt, brief.seed + k, ms)

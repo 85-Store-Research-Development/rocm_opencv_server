@@ -47,6 +47,7 @@ def method_for(product_type: str | None) -> str:
         return METHOD_SAM2
     return METHOD_BIREFNET
 
+
 # 品目（Shopify の商品タイプの英語名）→ 検出に使う語。無ければ GENERIC
 PROMPTS = {
     "Shirts": "shirt",

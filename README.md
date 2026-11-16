@@ -216,9 +216,23 @@ uv run --group clip --group clef-local python -m scripts.ad_compose \
 ... python -m scripts.ad_compose --crm-base https://<host> --out out/ --fonts <dir>
 ```
 
-- ブリーフ: `id` / `format` / `store{name,tagline,area_line}` / `headline`（2行まで）/ `aside` / `palette`（navy・brown・
-  burgundy・green・paper）/ `items[{id,image,label,item_type}]`（2〜6点）/ `seed` / `candidates`。
+- ブリーフ: `id` / `format` / `store{name,tagline,area_line}` / `headline`（2行まで）/ `aside` / `palette`（上の 10 色）/ `items[{id,image,label,item_type}]`（2〜6点）/ `seed` / `candidates`。
   商品は切り抜き（判定が check / fail は外して結果に残す）をキャッシュ（`data/ad-cutout-cache`）して使う
+- 季節感（任意）: ブリーフの `season`（`{motif, label, stamp, weather_line, stage, tmax, tmin, trend, estimated}`）を
+  読む。`motif` は `early_spring` / `spring` / `early_summer` / `summer` / `late_summer` / `autumn` / `late_autumn` /
+  `winter` / `midwinter`。無い・知らない値なら季節なし（従来の見た目）。motif ごとに 6 種類以上の手描きの落書き
+  （落ち葉・どんぐり・雪の結晶・桜・太陽・アイス・傘…。`app/ad_season.py`）を、汎用の星・波・矢印（多くても 2 つ）と混ぜて
+  置く。`stamp`（例「NOVEMBER / 晩秋」）は店名の右に手描きの楕円の枠つきの小さなスタンプとして置き、占有マップで
+  ほかの文字・商品・落書きと重ならない（置けなければ置かない）。`weather_line` は画像に入れない（文面側で使う）
+- 色は 10 色（`navy` / `brown` / `burgundy` / `green` / `mustard` / `olive` / `charcoal` / `cream` / `sky` / `terracotta`。
+  名前は CRM と共通で変えない。旧名 `paper` も受ける）。`cream`・`sky` は明るい地で、文字と線を濃くする。
+  文字・アクセント・線と地の明暗比は 4.5:1 以上（テストで確認。`app/ad_palette.py`）
+- 服が地に沈まないようにする: 切り抜きの画素から、アルファで重み付けした明るさ（L* の中央値）を測り、地との差が
+  24 未満の商品を「沈む」とする（商品の `tone`＝dark / mid / light は画素から測れないときの手がかり）。沈む商品があれば
+  まず色を替える（ブリーフの `palette_options` の中から。無ければ同じ明暗の系統から、沈む商品がより少なくなる色。
+  よくならなければ替えない）。替えても沈む商品は、縁に地よりわずかに明るい（明るい地では暗い）ぼかしの光の縁取りを足す
+  （**商品の画素は変えない**）。検査の点数には「商品と地の明暗の差」を 1 割混ぜる。使った色は `layout.json` と CRM への
+  `meta` の `palette_used` / `palette_changed_reason`（替えなければ null）に残る
 - 切り抜きの縁（白い服の襟元の欠け）には、背景除去専用の BiRefNet（`ZhengPeng7/BiRefNet`・MIT）を使える。重みは
   `~/models/birefnet/`（`CUTOUT_BIREFNET_PATH`）に置く（コミットしない）。`CUTOUT_METHOD=sam2+birefnet` か
   `Cutter.cut(method=...)` で選ぶ。無ければ SAM2 だけに戻る。比べる: `python -m scripts.cutout_compare --help`

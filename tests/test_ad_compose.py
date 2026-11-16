@@ -596,7 +596,8 @@ def test_meta_for_post_is_plain_json():
     c = ac.Candidate(7, lay, ac.check_layout(lay))
     fr = ac.FormatResult("4:5", "pass", c, [c], [], Path("a.png"), Path("a.json"), 1.0, [])
     meta = script.meta_for_post(fr)
-    assert set(meta) == {"format", "seed", "score", "verdict", "checks", "dropped_items"}
+    assert set(meta) >= {"format", "seed", "score", "verdict", "checks", "dropped_items"}
+    assert {"palette_used", "palette_changed_reason"} <= set(meta)
     assert meta["seed"] == 7
     json.dumps(meta)
 

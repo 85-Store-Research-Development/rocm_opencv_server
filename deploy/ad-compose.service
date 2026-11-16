@@ -1,0 +1,24 @@
+# CRM の「広告の案」のうち画像待ちの物を受け取り、切り抜いたコラージュの画像を作って返す（scripts/ad_compose.py）。
+# 1 回動いて終わる（画像待ちが無ければ、モデルを読み込まずにすぐ終わる）。ad-compose.timer が 10 分ごとに起こす。
+# 入れ方（sudo は要らない）:
+#   mkdir -p ~/.config/systemd/user ~/.config/ad-compose
+#   printf 'AD_CRM_BASE=https://<CRM のホスト>\nAD_FONTS=%s\n' "$HOME/.local/share/ad-compose/fonts" > ~/.config/ad-compose/env
+#   ln -sf ~/orca/rocm_opencv_server/deploy/ad-compose.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ad-compose.timer
+#   journalctl --user -u ad-compose -f
+# フォント（OFL。リポジトリには入れない）を AD_FONTS の場所に置くこと。CRM のホストはここに書かない（env ファイルに）
+[Unit]
+Description=CRM の広告の案の画像を作る（切り抜きのコラージュ）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/orca/rocm_opencv_server
+ExecStart=%h/orca/rocm_opencv_server/.venv/bin/python -m scripts.ad_compose --out %h/.local/share/ad-compose/out --formats 4:5,1:1,9:16
+EnvironmentFile=%h/.config/ad-compose/env
+Environment=PYTHONUNBUFFERED=1
+# モデルの重みは手元にあるので、Hugging Face に問い合わせない
+Environment=HF_HUB_OFFLINE=1
+# 案 3 本 × 3 形式で 1〜2 分。着画を探すと写真の取得が増える
+TimeoutStartSec=30min

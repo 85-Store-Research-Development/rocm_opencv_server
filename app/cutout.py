@@ -31,6 +31,21 @@ METHOD_BIREFNET = "sam2+birefnet"
 # 既定の方式。外套の襟元にハンガーが入る例があるため、既定は SAM2 だけのまま。
 # CUTOUT_METHOD=sam2+birefnet か cut(method=...) で選ぶ
 DEFAULT_METHOD = os.getenv("CUTOUT_METHOD", METHOD_SAM2)
+# 品目で使い分ける（method を指定せず、CUTOUT_METHOD も無いとき）。
+# 前が開く外套は襟元にハンガーの肩が見えていて、BiRefNet がそれを前景に入れる。
+# T シャツ・シャツ・ニット・スウェットは、襟ぐりの欠けが BiRefNet で埋まる。暫定（34 点の比較から）
+OUTERWEAR_TYPES = frozenset({"coats & jackets", "jackets", "coats", "vests", "outerwear"})
+
+
+def method_for(product_type: str | None) -> str:
+    """品目から切り抜きの方式を決める。CUTOUT_METHOD があればそれを優先。
+    品目が分からなければ SAM2 だけ"""
+    if os.getenv("CUTOUT_METHOD"):
+        return DEFAULT_METHOD
+    t = (product_type or "").strip().lower()
+    if not t or t in OUTERWEAR_TYPES:
+        return METHOD_SAM2
+    return METHOD_BIREFNET
 
 # 品目（Shopify の商品タイプの英語名）→ 検出に使う語。無ければ GENERIC
 PROMPTS = {
@@ -560,7 +575,8 @@ class Cutter:
         product_type: str | None = None,
         method: str | None = None,
     ) -> Result:
-        """method: None=既定（DEFAULT_METHOD）/ "sam2" / "sam2+birefnet"。BiRefNet が読めなければ
+        """method: None=品目で決める（method_for）/ "sam2" / "sam2+birefnet"。
+        BiRefNet が読めなければ
         黙って SAM2 だけに戻る（Result.method に実際に使った方式が入る）。"""
         import time
 
@@ -571,7 +587,7 @@ class Cutter:
             return Result(None, None, "fail", ["服を検出できなかった"], time.time() - t0)
         box, score = picked
         mask = self.segment(image, box)
-        if (method or DEFAULT_METHOD) == METHOD_BIREFNET and self.load_birefnet():
+        if (method or method_for(product_type)) == METHOD_BIREFNET and self.load_birefnet():
             result = finish_alpha(image, mask, self.foreground(image, box), score)
         else:
             result = finish(image, mask, score)

@@ -307,3 +307,13 @@ def test_kornia_stand_in_is_only_for_missing_kornia():
         for k in ("kornia", "kornia.filters"):
             sys.modules.pop(k, None)
         sys.modules.update(saved)
+
+
+def test_method_for_splits_by_item_type(monkeypatch):
+    monkeypatch.delenv("CUTOUT_METHOD", raising=False)
+    assert cutout.method_for("Coats & Jackets") == cutout.METHOD_SAM2
+    assert cutout.method_for(None) == cutout.METHOD_SAM2
+    assert cutout.method_for("Shirts") == cutout.METHOD_BIREFNET
+    assert cutout.method_for("T-Shirts") == cutout.METHOD_BIREFNET
+    monkeypatch.setenv("CUTOUT_METHOD", "sam2")
+    assert cutout.method_for("Shirts") == cutout.DEFAULT_METHOD

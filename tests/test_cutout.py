@@ -1,0 +1,153 @@
+import numpy as np
+from PIL import Image
+
+from app import cutout
+from scripts import cutout_trial
+
+
+def blob(h=200, w=200, box=(60, 40, 140, 160)):
+    m = np.zeros((h, w), bool)
+    x0, y0, x1, y1 = box
+    m[y0:y1, x0:x1] = True
+    return m
+
+
+def test_clean_mask_fills_small_hole_and_drops_speck():
+    m = blob()
+    m[90:93, 90:93] = False  # 内側の小さな穴
+    m[5:7, 5:7] = True  # 孤立した粒
+    out = cutout.clean_mask(m)
+    assert out[91, 91]
+    assert not out[5, 5]
+    assert out[100, 100]
+
+
+def test_clean_mask_keeps_big_hole_and_border_background():
+    m = blob(box=(20, 20, 180, 180))
+    m[60:140, 60:140] = False  # 大きな穴（襟ぐりの外など）は残す
+    out = cutout.clean_mask(m)
+    assert not out[100, 100]
+
+
+def test_soften_edge_shrinks_and_is_soft():
+    a = cutout.soften_edge(blob())
+    assert a.dtype == np.uint8
+    assert a[100, 100] == 255
+    assert a[40, 100] < 255  # 元の縁は内側に寄っている
+    assert a[10, 10] == 0
+
+
+def test_rgba_keeps_pixels_untouched():
+    img = Image.new("RGB", (50, 50), (10, 200, 30))
+    rgba = cutout.to_rgba(img, np.full((50, 50), 255, np.uint8))
+    assert rgba.mode == "RGBA"
+    assert rgba.getpixel((3, 3)) == (10, 200, 30, 255)
+
+
+def test_crop_to_content_adds_margin_and_clamps():
+    rgba = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+    rgba.paste((255, 0, 0, 255), (50, 60, 150, 120))
+    out = cutout.crop_to_content(rgba, margin=0.1)
+    assert out.size == (120, 80)
+    full = Image.new("RGBA", (40, 40), (1, 2, 3, 255))
+    assert cutout.crop_to_content(full).size == (40, 40)
+    assert cutout.crop_to_content(Image.new("RGBA", (9, 9), (0, 0, 0, 0))).size == (9, 9)
+
+
+def test_measure_and_grade_ok():
+    q = cutout.measure(blob(box=(50, 30, 150, 170)), 0.7)
+    assert not q.touches_border and q.components == 1
+    assert q.grade()[0] == "ok"
+
+
+def test_grade_border_and_pieces_need_check():
+    m = blob(box=(0, 30, 120, 170))
+    q = cutout.measure(m, 0.7)
+    assert q.touches_border
+    status, reasons = q.grade()
+    assert status == "check" and any("見切れ" in r for r in reasons)
+    two = blob(box=(10, 40, 80, 160)) | blob(box=(110, 40, 190, 160))
+    assert cutout.measure(two, 0.7).components == 2
+
+
+def test_grade_fail_cases():
+    assert cutout.Quality(0.01, False, 1, 0.8).grade()[0] == "fail"
+    assert cutout.Quality(0.97, False, 1, 0.8).grade()[0] == "fail"
+    assert cutout.Quality(0.3, False, 1, 0.1).grade()[0] == "fail"
+    assert cutout.Quality(0.3, False, 1, 0.35).grade()[0] == "check"
+
+
+def test_pick_box_prefers_large_confident_box():
+    boxes = [[0, 0, 20, 20], [10, 10, 190, 190]]
+    box, score = cutout.pick_box(boxes, [0.6, 0.5], (200, 200))
+    assert box == boxes[1]
+    assert cutout.pick_box([], [], (10, 10)) is None
+    # 下限未満しか無ければ確信度の最大（判定側で fail）
+    assert cutout.pick_box(boxes, [0.1, 0.05], (200, 200))[1] == 0.1
+
+
+def test_prompt_for():
+    assert "shirt" in cutout.prompt_for("Shirts")
+    assert cutout.prompt_for(None) == cutout.GENERIC_PROMPT
+
+
+def test_finish_fail_returns_no_image():
+    img = Image.new("RGB", (200, 200), (255, 255, 255))
+    res = cutout.finish(img, np.zeros((200, 200), bool) | blob(box=(0, 0, 4, 4)), 0.9)
+    assert res.status == "fail" and res.rgba is None
+
+
+def test_finish_ok_returns_cropped_rgba():
+    img = Image.new("RGB", (200, 200), (120, 120, 120))
+    res = cutout.finish(img, blob(box=(50, 30, 150, 170)), 0.8)
+    assert res.status == "ok"
+    assert res.rgba.mode == "RGBA" and res.rgba.width < 200
+
+
+def test_pick_targets_spreads_types():
+    preds = {
+        f"gid://x/Product/{i}": {
+            "productType": t,
+            "images": [f"u{i}"],
+            "title": "t",
+            "photo": {"answers": {"subtype": {"choice": c}}},
+        }
+        for i, (t, c) in enumerate(
+            [("Shirts", "a")] * 5
+            + [("Shirts", "b")] * 3
+            + [("Coats", "x")] * 3
+            + [("Knit", "y")] * 3
+        )
+    }
+    out = cutout_trial.pick_targets(preds, 6)
+    assert len(out) == 6 and len({o["id"] for o in out}) == 6
+    assert {o["product_type"] for o in out} == {"Shirts", "Coats", "Knit"}
+    assert out[0]["url"]
+
+
+def test_page_is_self_contained_and_escapes():
+    rows = [
+        {
+            "id": "1",
+            "product_type": "Shirts",
+            "source": "1_src.jpg",
+            "cutout": "1.png",
+            "status": "ok",
+            "reasons": [],
+            "seconds": 1.2,
+            "quality": {"area_ratio": 0.3, "box_score": 0.7, "components": 1},
+        },
+        {
+            "id": "2<b>",
+            "product_type": "",
+            "source": "2_src.jpg",
+            "status": "fail",
+            "reasons": ["服を検出できなかった"],
+            "seconds": 0.5,
+            "quality": None,
+        },
+    ]
+    out = cutout_trial.page(rows)
+    assert "http" not in out.replace("http-equiv", "")
+    assert "2&lt;b&gt;" in out and "1.png" in out
+    assert "ok 1 ・ check 0 ・ fail 1" in out

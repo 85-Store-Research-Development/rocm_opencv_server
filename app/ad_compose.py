@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageFont
 
-from app import ad_season, ad_single, ad_worn
+from app import ad_lineup, ad_season, ad_single, ad_worn
 from app.ad_palette import (  # noqa: F401  色の部品（テスト・外からも ad_compose 経由で使える）
     DEFAULT_PALETTE,
     MIN_CONTRAST,
@@ -126,6 +126,7 @@ WORN_LINK_CLEAR = (
 # 着画つきで気持ちよく入る商品の点数の目安（形式ごと。着画の商品を含む）。超えるぶんは後ろから外す
 WORN_MAX_ITEMS = {"4:5": 4, "1:1": 3, "9:16": 3}
 PROBE_CANDIDATES = 4  # 点数を減らして試すとき、まずこの数で1つも通らなければ次の点数へ
+LINEUP_WORN_MAX_DROP = 1  # lineup で着画のために外してよい商品の数
 WORN_MIN_OTHERS = 2  # 着画の商品のアイテム写真のほかに、最低これだけは残す
 SHORT_LABEL = re.compile(r"^(?P<brand>.+?) の (?P<rest>.+ ¥\d[\d,]*)$")
 WORN_LINK_THICK = 18  # 点線の矢印が空いていなければならない太さ（px）
@@ -226,8 +227,11 @@ class Brief:
     palette_requested: str = ""  # ブリーフの palette（palette は実際に使う色）
     palette_changed_reason: str | None = None
     worn_note: str = ""  # 着画に添える短い手書きの文（無ければ添えない）
-    layout: str = "collage"  # collage（複数を並べる・既定）/ single（1点もの）
+    layout: str = (
+        "collage"  # collage（複数を並べる・既定）/ single（1点もの）/ lineup（新品のまとめ見せ）
+    )
     single: ad_single.Single | None = None  # layout が single のときの 価格・シール・メモ
+    lineup: ad_lineup.Lineup | None = None  # layout が lineup のときの 型・色・サイズ・価格
 
 
 _ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -310,17 +314,43 @@ def parse_brief(raw: dict) -> Brief:
     items: list[BriefItem] = []
     raw_items = raw.get("items")
     if not isinstance(raw_items, list):
-        problems.append("items は配列にしてください")
+        if raw.get("layout") != ad_lineup.LAYOUT_NAME:  # lineup の商品は lineup.groups にある
+            problems.append("items は配列にしてください")
         raw_items = []
     layout = ad_single.LAYOUT_NAME if raw.get("layout") == ad_single.LAYOUT_NAME else "collage"
     single = None
+    lineup = None
+    lineup_ok = False
+    if (
+        raw.get("layout") == ad_lineup.LAYOUT_NAME
+    ):  # 新品のまとめ見せ: 商品は lineup.groups[].items[]
+        lineup, lp, raw_items = ad_lineup.parse_lineup(raw.get("lineup"))
+        problems.extend(lp)
+        lineup_ok = lineup is not None and not lp
+        if lineup_ok:
+            labels = {
+                li.id: ad_lineup.item_label(lineup, g, li) or li.color or g.name
+                for g in lineup.groups
+                for li in g.items
+            }
+            raw_items = [{**r, "label": labels.get(r["id"], r["id"])} for r in raw_items]
+            if lineup.style:
+                layout = ad_lineup.LAYOUT_NAME
+            else:  # 知らない style は collage に落とす（商品を並べるだけ）
+                layout, lineup = "collage", None
+                raw_items = raw_items[:MAX_ITEMS]
     if layout == "single":  # 1点もの: 主役は先頭の1点（ほかは使わない）
         single, single_problems = ad_single.parse_single(raw.get("single"))
         problems.extend(single_problems)
         if not 1 <= len(raw_items) <= MAX_ITEMS:
             problems.append(f"items は 1 点以上にしてください（{len(raw_items)} 点）")
         raw_items = raw_items[:1]
-    elif not MIN_ITEMS <= len(raw_items) <= MAX_ITEMS:
+    elif layout == ad_lineup.LAYOUT_NAME or (lineup_ok and layout == "collage"):
+        if not MIN_ITEMS <= len(raw_items) <= ad_lineup.MAX_ITEMS:
+            problems.append(
+                f"lineup の商品は {MIN_ITEMS} 点以上にしてください（{len(raw_items)} 点）"
+            )
+    elif not MIN_ITEMS <= len(raw_items) <= MAX_ITEMS and not lineup_ok:
         problems.append(
             f"items は {MIN_ITEMS}〜{MAX_ITEMS} 点にしてください（{len(raw_items)} 点）"
         )
@@ -386,6 +416,7 @@ def parse_brief(raw: dict) -> Brief:
         worn_note=worn_note,
         layout=layout,
         single=single,
+        lineup=lineup,
     )
 
 
@@ -931,9 +962,14 @@ def layout_fixed(brief: Brief, fmt: str, ms: Measurer) -> Fixed:
         floor_y = H - geo.safe_bottom - 24
     ex = round(ITEM_EDGE_RATIO * W)
     region = (float(ex), float(bottom + 28), float(W - ex), float(floor_y))
-    if region[3] - region[1] < 0.25 * H:
+    fixed = Fixed(blocks, region, notes)
+    if brief.layout == ad_lineup.LAYOUT_NAME:  # ブランド特集は、題字の分だけ範囲を下げる
+        from app import ad_lineup_layout
+
+        ad_lineup_layout.add_masthead(fixed, brief, geo, ms)
+    if fixed.region[3] - fixed.region[1] < 0.25 * H:
         notes.append("商品を置ける範囲が狭い")
-    return Fixed(blocks, region, notes)
+    return fixed
 
 
 # ---------------------------------------------------------------- 商品（切り抜き）
@@ -958,7 +994,7 @@ class Sprite:
 
 ALPHA_MAX_H = 700
 # 切り抜きの判定の規則を変えたら上げる（古い判定のキャッシュを使わない）
-CUTOUT_CACHE_VERSION = 4
+CUTOUT_CACHE_VERSION = 5
 
 
 TONE_MAX_H = 300  # 明るさを測るときに縮める高さ
@@ -1656,6 +1692,7 @@ class Layout:
     layout: str = "collage"
     single: ad_single.SinglePlan | None = None  # 1点ものの メモ・札・細部の写真
     single_target_h: float = 0.0  # 1点ものの主役の高さの目標（点数用）
+    lineup: ad_lineup.LineupPlan | None = None  # 新品のまとめ見せの 文字・札・色見本
 
     def to_json(self) -> dict:
         items = []
@@ -1695,6 +1732,7 @@ class Layout:
             "worn_link": None if self.link is None else self.link["pts"],
             "layout": self.layout,
             "single": None if self.single is None else self.single.to_json(),
+            "lineup": None if self.lineup is None else self.lineup.to_json(),
             "season": None if self.season is None else self.season.to_json(),
             "region": [round(v, 1) for v in self.region],
             "blocks": [b.to_json() for b in self.blocks],
@@ -2105,6 +2143,7 @@ class Checks:
     score: float = 0.0
     score_parts: dict = field(default_factory=dict)
     single: dict | None = None  # 1点ものの検査の数（メモ・線・札・写真）
+    lineup: dict | None = None  # 新品のまとめ見せの検査の数（名前の大きさ・型の数・札）
 
     def violations(self) -> int:
         return len(self.problems)
@@ -2131,13 +2170,22 @@ def check_layout(lay: Layout, ms: Measurer | None = None) -> Checks:
     c.items_outside_px = outside
     if outside:
         c.problems.append(f"商品が画面の端からはみ出している（{outside}px）")
+    group_of = lay.lineup.group_of if lay.lineup is not None else {}
+    within_max = 0.0
     for i in range(len(masks)):
         for j in range(i + 1, len(masks)):
-            c.item_overlap_max = max(c.item_overlap_max, item_overlap_ratio(masks[i], masks[j]))
+            ratio = item_overlap_ratio(masks[i], masks[j])
+            gi, gj = group_of.get(lay.items[i].sprite.id), group_of.get(lay.items[j].sprite.id)
+            if gi is not None and gi == gj:  # 同じ型の色ちがいは、重ねて見せてよい
+                within_max = max(within_max, ratio)
+            else:
+                c.item_overlap_max = max(c.item_overlap_max, ratio)
     c.item_overlap_max = round(c.item_overlap_max, 3)
     if c.item_overlap_max > MAX_ITEM_OVERLAP:
         c.problems.append(f"商品どうしが重なりすぎ（{c.item_overlap_max:.0%}）")
-    min_h = MIN_ITEM_H_RATIO * W
+    if within_max > ad_lineup.GROUP_OVERLAP_MAX:
+        c.problems.append(f"同じ型の色ちがいが重なりすぎ（{within_max:.0%}）")
+    min_h = (ad_lineup.MIN_ITEM_H_RATIO if lay.lineup is not None else MIN_ITEM_H_RATIO) * W
     c.min_item_h = round(min(it.h for it in lay.items), 1)
     c.small_items = [it.sprite.id for it in lay.items if it.h < min_h]
     if c.small_items:
@@ -2166,6 +2214,16 @@ def check_layout(lay: Layout, ms: Measurer | None = None) -> Checks:
         texts.append((f"label:{it.sprite.id}", band.full(W, H)))
     if lay.link is not None:  # 着画からの点線の矢印（商品・文字に重ならない）
         texts.append(("link", lay.link["mask"]))
+    lineup_texts = np.zeros((H, W), bool)
+    if lay.lineup is not None:  # 型の名前・色の名前・サイズ・札の文字（色見本の丸も文字の仲間）
+        for t in lay.lineup.texts:
+            m = polygon_mask(t.polygon(2), size)
+            lineup_texts |= m
+            texts.append((f"lt:{t.kind}", m))
+        for sw in lay.lineup.swatches:
+            m = polygon_mask(rect_polygon(sw.cx - sw.r, sw.cy - sw.r, 2 * sw.r, 2 * sw.r), size)
+            lineup_texts |= m
+            texts.append(("swatch", m))
     if c.truncated_labels:
         c.problems.append(f"ラベルが弧に収まらず末尾が欠ける（{', '.join(c.truncated_labels)}）")
     if c.reversed_labels:
@@ -2208,6 +2266,26 @@ def check_layout(lay: Layout, ms: Measurer | None = None) -> Checks:
     )
     if c.doodle_overlap_px > TOLERANCE_PX:
         c.problems.append(f"落書きが商品や文字に重なっている（{c.doodle_overlap_px}px）")
+    if lay.lineup is not None:
+        lc, lp = ad_lineup.check_plan(
+            lay.lineup, union=union, safe=geo.safe_rect, texts_mask=lineup_texts, width=W
+        )
+        c.lineup = asdict(lc)
+        c.problems.extend(lp)
+        c.verdict = "pass" if not c.problems else "fail"
+        both = union | lineup_texts
+        for b in lay.lineup.badges:
+            both |= b.disc_mask((H, W))
+        c.score, c.score_parts = ad_lineup.score_plan(union=both, region=lay.region)
+        contrast = contrast_score(
+            [it.sprite.light for it in lay.items],
+            PALETTES[lay.palette].bg,
+            [it.glow for it in lay.items],
+        )
+        if contrast is not None:
+            c.score_parts["contrast"] = round(contrast, 3)
+            c.score = round((1 - CONTRAST_WEIGHT) * c.score + 100 * CONTRAST_WEIGHT * contrast, 1)
+        return c
     if lay.single is not None:
         blocked = np.zeros((H, W), bool)
         for _, m in texts:
@@ -2379,6 +2457,8 @@ font-weight:700;letter-spacing:.1em;text-anchor:middle}}
 svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;letter-spacing:.03em}}
 .acc{{color:{pal.accent}}}
 {ad_single.css(pal) if lay.single is not None else ""}
+{ad_lineup.css(pal) if lay.lineup is not None else ""}
+.masthead{{font-weight:900;letter-spacing:-.02em;line-height:{HEAD_LINE_HEIGHT};color:{pal.accent}}}
 """
     body: list[str] = []
     glow = glow_color(pal)
@@ -2403,6 +2483,7 @@ svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;lette
             "headline": "head",
             "aside": "hand",
             "tagline": "hand",
+            "masthead": "head masthead",
         }[b.name]
         pos = f"top:{b.y:.1f}px;"
         pos += f"right:{W - (b.x + b.w):.1f}px;" if b.align == "right" else f"left:{b.x:.1f}px;"
@@ -2424,6 +2505,8 @@ svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;lette
         body.append(f'<div class="b {cls}" style="{style}">{inner}</div>')
     if lay.single is not None:
         body.extend(ad_single.html_parts(lay.single, pal, e, W))
+    if lay.lineup is not None:
+        body.extend(ad_lineup.html_parts(lay.lineup, pal, e))
     svg = [f'<svg class="ov" width="{W}" height="{H}" viewBox="0 0 {W} {H}">']
     for d in lay.doodles:
         k = d.size / 100
@@ -2459,6 +2542,8 @@ svg.ov text{{fill:{pal.text};font-family:"Caveat","Yomogi";font-weight:700;lette
         )
     if lay.single is not None:
         svg.extend(ad_single.svg_parts(lay.single, pal, e))
+    if lay.lineup is not None:
+        svg.extend(ad_lineup.svg_parts(lay.lineup, pal, e))
     svg.append("</svg>")
     return (
         f'<!doctype html><meta charset="utf-8"><style>{css}</style><body>'
@@ -2544,6 +2629,8 @@ class FormatResult:
         extra = {} if self.revision is None else {"revision": self.revision}
         lay = self.best.layout
         single = {} if lay.single is None else single_meta(lay)
+        if lay.layout == ad_lineup.LAYOUT_NAME:
+            single = lineup_meta(lay)
         short = [
             {"id": it.sprite.id, "from": it.label_full, "to": it.sprite.label}
             for it in lay.items
@@ -2602,6 +2689,36 @@ def reduce_items(
     return keep, removed[::-1]
 
 
+def reduce_lineup_items(
+    sprites: list[Sprite],
+    n: int,
+    keep_id: str | None,
+    group_of: dict[str, int],
+    protect: bool = True,
+) -> tuple[list[Sprite], list[Sprite]]:
+    """lineup: 後ろから外すが、protect のあいだは型（グループ）の最後の1点は外さない
+    （型が丸ごと消えないように）。それでも入らないときだけ protect=False で後ろの型を省く。"""
+    keep = list(sprites)
+    removed: list[Sprite] = []
+    for i in range(len(keep) - 1, -1, -1):
+        if len(keep) <= n:
+            break
+        sp = keep[i]
+        if sp.id == keep_id:
+            continue
+        g = group_of.get(sp.id)
+        if protect and g is not None and sum(1 for o in keep if group_of.get(o.id) == g) <= 1:
+            continue
+        removed.append(keep.pop(i))
+    return keep, removed[::-1]
+
+
+def lineup_meta(lay: Layout) -> dict:
+    if lay.lineup is not None:
+        return ad_lineup.lineup_meta(lay.lineup)
+    return {"layout": ad_lineup.LAYOUT_NAME, "lineup_style": "brand"}  # 題字つきの collage
+
+
 def compose_format(
     brief: Brief,
     sprites: list[Sprite],
@@ -2632,14 +2749,34 @@ def compose_format(
         )
     fallback = None
     single = brief.layout == ad_single.LAYOUT_NAME
+    is_lineup = brief.layout == ad_lineup.LAYOUT_NAME and brief.lineup is not None
+    group_of = (
+        {li.id: gi for gi, g in enumerate(brief.lineup.groups) for li in g.items}
+        if is_lineup
+        else {}
+    )
     omitted: list[dict] = []  # 入りきらなくて外した商品（dropped_items に足す）
+
+    def shrink(subset_n: int, keep_id: str | None, protect: bool = True):
+        if is_lineup:
+            return reduce_lineup_items(sprites, subset_n, keep_id, group_of, protect)
+        return reduce_items(sprites, subset_n, keep_id)
 
     def build(k: int, subset: list[Sprite], with_worn: Sprite | None) -> Layout:
         if single:  # 1点もの。着画が無い（外した）ときだけ細部の写真を添える
             return build_single_layout(
                 brief, subset, fmt, brief.seed + k, ms, with_worn, None if with_worn else details
             )
-        return build_layout(brief, subset, fmt, brief.seed + k, ms, with_worn)
+        if is_lineup and brief.lineup.style != "brand":  # 新品のまとめ見せ（型・色の段組み）
+            from app import ad_lineup_layout
+
+            return ad_lineup_layout.build_lineup_layout(
+                brief, subset, fmt, brief.seed + k, ms, with_worn
+            )
+        lay = build_layout(brief, subset, fmt, brief.seed + k, ms, with_worn)
+        if is_lineup:  # ブランド特集: 題字つきの collage
+            lay.layout = ad_lineup.LAYOUT_NAME
+        return lay
 
     def run(subset: list[Sprite], with_worn: Sprite | None) -> list[Candidate]:
         """この商品の並びで候補を作って並べる。先に PROBE_CANDIDATES 個で通る物が無ければ止める。"""
@@ -2664,11 +2801,16 @@ def compose_format(
         # 着画が優先: 入らないときは、着画を諦める前に商品を後ろから1点ずつ減らす
         # （着画の商品は外さない。下限は 着画の商品 + ほか2点）
         wid = worn.id.removesuffix("#worn")
-        start = min(len(sprites), WORN_MAX_ITEMS[fmt])
-        low = min(len(sprites), 1 + WORN_MIN_OTHERS)
+        start = len(sprites) if is_lineup else min(len(sprites), WORN_MAX_ITEMS[fmt])
+        # lineup は商品が主役: 着画のために外すのは 1 点まで（それで入らなければ着画を諦める）
+        low = (
+            max(len(sprites) - LINEUP_WORN_MAX_DROP, 1)
+            if is_lineup
+            else min(len(sprites), 1 + WORN_MIN_OTHERS)
+        )
         last: Candidate | None = None
-        for n in range(start, low - 1, -1):
-            subset, removed = reduce_items(sprites, n, wid)
+        for n in range(start, max(low, 1) - 1, -1):
+            subset, removed = shrink(n, wid)
             cands = run(subset, worn)
             if cands[0].checks.verdict == "pass":
                 omitted = omit(removed, "着画を入れるため")
@@ -2687,7 +2829,7 @@ def compose_format(
         # 着画なしは、ブリーフの点数をなるべく保つ。検査に通らないときだけ後ろから減らす
         first: list[Candidate] | None = None
         for n in range(len(sprites), (1 if single else MIN_ITEMS) - 1, -1):
-            subset, removed = reduce_items(sprites, n, None)
+            subset, removed = shrink(n, None)
             got = run(subset, None)
             first = first or got
             if got[0].checks.verdict == "pass" or single:
@@ -2696,6 +2838,16 @@ def compose_format(
                 if removed:
                     log(f"  検査に通るよう {len(removed)} 点を外した")
                 break
+        if is_lineup and (not cands or cands[0].checks.verdict != "pass"):
+            # 型を残したままでは入らない: 後ろの型を丸ごと省いてよい（style の下限の型数までは）
+            for n in range(len(sprites) - 1, 1, -1):
+                subset, removed = shrink(n, None, protect=False)
+                got = run(subset, None)
+                if got[0].checks.verdict == "pass":
+                    cands = got
+                    omitted = omit(removed, "この形式に入りきらず、検査に通らなかったため")
+                    log(f"  検査に通るよう {len(removed)} 点（後ろの型）を外した")
+                    break
         if not cands or cands[0].checks.verdict != "pass":
             cands, omitted = first or cands, []  # どれも通らない: 全点で needs_review にする
     dropped = [*dropped, *omitted]

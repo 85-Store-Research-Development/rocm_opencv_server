@@ -124,6 +124,16 @@ BORDER_TOUCH = 0.01
 COMPONENT_RATIO = 0.05
 # マスクの外接矩形の 高さ ÷ 幅 がこれ超なら、着ている人まで取っている疑い（長いコートで 1.5 ほど）
 MAX_ASPECT = 1.9
+# パンツ・ショーツは吊るして写すと縦に長い（ワイドパンツで 2.1 ほど）。
+# 人まで含む（胴から足先まで）なら 2.5 を超えるので、この品目だけ上限を上げる
+# （暫定。吊るしたパンツ 10 点で見た値）
+MAX_ASPECT_BOTTOMS = 2.4
+BOTTOMS_TYPES = frozenset({"trousers", "short trousers", "pants", "shorts"})
+
+
+def max_aspect_for(product_type: str | None) -> float:
+    t = (product_type or "").strip().lower()
+    return MAX_ASPECT_BOTTOMS if t in BOTTOMS_TYPES else MAX_ASPECT
 
 
 @dataclass
@@ -136,8 +146,8 @@ class Quality:
     edge_delta: float = NO_EDGE_DELTA  # 上の部分の境目の色の差（小さいほど境目が弱い）
     roughness: float = 0.0  # 上の部分の輪郭のギザギザ
 
-    def grade(self) -> tuple[str, list[str]]:
-        return grade(self)
+    def grade(self, product_type: str | None = None) -> tuple[str, list[str]]:
+        return grade(self, product_type)
 
 
 @dataclass
@@ -314,7 +324,7 @@ def measure(mask: np.ndarray, box_score: float, image: Image.Image | None = None
     )
 
 
-def grade(q: Quality) -> tuple[str, list[str]]:
+def grade(q: Quality, product_type: str | None = None) -> tuple[str, list[str]]:
     """ok / check / fail と理由（日本語）。fail なら切り抜かず写真のまま使う。"""
     fails, checks = [], []
     if q.box_score < BOX_MIN_SCORE:
@@ -329,7 +339,7 @@ def grade(q: Quality) -> tuple[str, list[str]]:
         checks.append("服が画像の端で見切れている")
     if q.components > 1:
         checks.append(f"マスクが{q.components}つの塊に分かれている")
-    if q.aspect > MAX_ASPECT:
+    if q.aspect > max_aspect_for(product_type):
         checks.append(f"縦に細長い（高さ÷幅 {q.aspect:.1f}）。着用写真で人まで含む疑い")
     if q.area_ratio < CHECK_AREA_MIN:
         checks.append(f"マスクが小さい（画像の{q.area_ratio:.0%}）")
@@ -409,7 +419,11 @@ def refine_alpha(sam_mask: np.ndarray, fg: np.ndarray) -> np.ndarray:
 
 
 def finish_alpha(
-    image: Image.Image, sam_mask: np.ndarray, fg: np.ndarray, box_score: float
+    image: Image.Image,
+    sam_mask: np.ndarray,
+    fg: np.ndarray,
+    box_score: float,
+    product_type: str | None = None,
 ) -> Result:
     """SAM2 のマスクと BiRefNet のアルファから、判定・RGBA まで（モデルを使わない部分）。
     判定は合わせたあとのアルファ（BIREFNET_SOLID 超）で測り直す。"""
@@ -419,7 +433,7 @@ def finish_alpha(
     keep = cv2.dilate(solid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     alpha = np.where(keep, alpha, 0.0)
     q = measure(solid, box_score, image)
-    status, reasons = grade(q)
+    status, reasons = grade(q, product_type)
     if status == "fail":
         return Result(None, q, status, reasons, method=METHOD_BIREFNET)
     a8 = np.round(alpha * 255).astype(np.uint8)
@@ -427,11 +441,13 @@ def finish_alpha(
     return Result(rgba, q, status, reasons, method=METHOD_BIREFNET)
 
 
-def finish(image: Image.Image, mask: np.ndarray, box_score: float) -> Result:
+def finish(
+    image: Image.Image, mask: np.ndarray, box_score: float, product_type: str | None = None
+) -> Result:
     """生のマスクから、後処理・判定・RGBA まで（モデルを使わない部分）。"""
     mask = clean_mask(mask)
     q = measure(mask, box_score, image)
-    status, reasons = grade(q)
+    status, reasons = grade(q, product_type)
     if status == "fail":
         return Result(None, q, status, reasons)
     rgba = crop_to_content(to_rgba(image, soften_edge(mask)))
@@ -723,8 +739,8 @@ class Cutter:
         box, score = picked
         mask = self.segment(image, box)
         if (method or method_for(product_type)) == METHOD_BIREFNET and self.load_birefnet():
-            result = finish_alpha(image, mask, self.foreground(image, box), score)
+            result = finish_alpha(image, mask, self.foreground(image, box), score, product_type)
         else:
-            result = finish(image, mask, score)
+            result = finish(image, mask, score, product_type)
         result.seconds = time.time() - t0
         return result

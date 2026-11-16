@@ -209,3 +209,101 @@ def test_tall_narrow_mask_needs_check():
     assert q.aspect > cutout.MAX_ASPECT
     status, reasons = q.grade()
     assert status == "check" and any("細長い" in r for r in reasons)
+
+
+# ---------------------------------------------- BiRefNet との合わせ方（モデルを使わない）
+
+
+def test_refine_alpha_is_zero_outside_the_grown_region():
+    sam = blob(h=400, w=400, box=(100, 100, 300, 300))
+    fg = np.ones(sam.shape, np.float32)  # BiRefNet は全面を前景と言う
+    out = cutout.refine_alpha(sam, fg)
+    assert out[200, 200] == 1.0
+    assert out[5, 5] == 0.0  # 膨らませた領域の外は 0
+    assert out[200, 20] == 0.0
+
+
+def test_refine_alpha_fills_a_notch_but_not_a_distant_hanger():
+    sam = blob(h=400, w=400, box=(100, 100, 300, 300))
+    sam[100:112, 192:208] = False  # 襟元の欠け（へこみ）
+    fg = np.zeros(sam.shape, np.float32)
+    fg[100:300, 100:300] = 1.0  # 欠けた所も前景と言っている
+    fg[40:90, 195:205] = 1.0  # マスクから離れたハンガーのフック
+    out = cutout.refine_alpha(sam, fg)
+    assert out[105, 200] > 0.5  # 欠けは埋まる
+    assert out[60, 200] == 0.0  # フックは入らない
+
+
+def test_refine_alpha_drops_thin_things_next_to_the_mask():
+    sam = blob(h=400, w=400, box=(100, 100, 300, 300))
+    fg = np.zeros(sam.shape, np.float32)
+    fg[100:300, 100:300] = 1.0
+    fg[93:100, 150:153] = 1.0  # 縁にくっついた細い針金（幅3px）
+    out = cutout.refine_alpha(sam, fg)
+    assert out[96, 151] == 0.0
+
+
+def test_refine_alpha_keeps_the_core_opaque_even_if_birefnet_says_background():
+    sam = blob(h=400, w=400, box=(100, 100, 300, 300))
+    fg = np.zeros(sam.shape, np.float32)  # BiRefNet が何も前景と言わない
+    out = cutout.refine_alpha(sam, fg)
+    assert out[200, 200] == 1.0
+
+
+def test_finish_alpha_keeps_pixels_and_reports_method():
+    img = Image.fromarray(np.random.default_rng(0).integers(0, 255, (400, 400, 3), np.uint8))
+    sam = blob(h=400, w=400, box=(100, 100, 300, 300))
+    r = cutout.finish_alpha(img, sam, sam.astype(np.float32), 0.9)
+    assert r.method == cutout.METHOD_BIREFNET
+    assert r.summary()["method"] == "sam2+birefnet"
+    assert r.rgba is not None
+    rgb = np.asarray(r.rgba.convert("RGB"))
+    # 中心の画素は元の写真のまま（描き直さない）
+    a = np.asarray(r.rgba.getchannel("A"))
+    cy, cx = np.array(a.shape) // 2
+    assert (rgb[cy, cx] == np.asarray(img)[200, 200]).all()
+
+
+def test_finish_without_birefnet_is_sam2():
+    img = Image.fromarray(np.zeros((400, 400, 3), np.uint8))
+    r = cutout.finish(img, blob(h=400, w=400, box=(100, 100, 300, 300)), 0.9)
+    assert r.method == cutout.METHOD_SAM2
+
+
+def test_cut_falls_back_to_sam2_when_birefnet_cannot_load(tmp_path):
+    class Stub(cutout.Cutter):
+        def __init__(self):  # モデルは読まない
+            self.birefnet_path = str(tmp_path / "none")
+            self.birefnet = None
+            self._birefnet_tried = False
+            self.birefnet_error = ""
+            self.device = "cpu"
+
+        def detect(self, image, product_type):
+            return [0.0, 0.0, 10.0, 10.0], 0.9
+
+        def segment(self, image, box):
+            return blob(h=400, w=400, box=(100, 100, 300, 300))
+
+    img = Image.fromarray(np.zeros((400, 400, 3), np.uint8))
+    r = Stub().cut(img, "Shirts", method=cutout.METHOD_BIREFNET)
+    assert r.method == cutout.METHOD_SAM2  # 黙って SAM2 だけに戻る
+    assert r.status in ("ok", "check")
+
+
+def test_kornia_stand_in_is_only_for_missing_kornia():
+    import sys
+
+    saved = {k: sys.modules.pop(k) for k in ("kornia", "kornia.filters") if k in sys.modules}
+    try:
+        cutout._ensure_kornia()
+        if "kornia" in sys.modules and hasattr(sys.modules["kornia"], "filters"):
+            lap = sys.modules["kornia.filters"].laplacian
+            try:
+                lap()
+            except NotImplementedError:
+                pass
+    finally:
+        for k in ("kornia", "kornia.filters"):
+            sys.modules.pop(k, None)
+        sys.modules.update(saved)

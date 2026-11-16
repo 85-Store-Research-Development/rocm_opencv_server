@@ -219,6 +219,9 @@ uv run --group clip --group clef-local python -m scripts.ad_compose \
 - ブリーフ: `id` / `format` / `store{name,tagline,area_line}` / `headline`（2行まで）/ `aside` / `palette`（navy・brown・
   burgundy・green・paper）/ `items[{id,image,label,item_type}]`（2〜6点）/ `seed` / `candidates`。
   商品は切り抜き（判定が check / fail は外して結果に残す）をキャッシュ（`data/ad-cutout-cache`）して使う
+- 切り抜きの縁（白い服の襟元の欠け）には、背景除去専用の BiRefNet（`ZhengPeng7/BiRefNet`・MIT）を使える。重みは
+  `~/models/birefnet/`（`CUTOUT_BIREFNET_PATH`）に置く（コミットしない）。`CUTOUT_METHOD=sam2+birefnet` か
+  `Cutter.cut(method=...)` で選ぶ。無ければ SAM2 だけに戻る。比べる: `python -m scripts.cutout_compare --help`
 - 規則: 配置は占有マップ（商品のマスク・輪郭の文字の帯・見出しなどの矩形）で重なりを測りながら決める。検査は
   文字と商品・文字どうしの重なり、はみ出し、安全域（左右 6%・9:16 は上下 14% を文字なし）、商品の小ささ、見出しの行数。
   `candidates` の数だけ種を変えて作り、pass の中で点数の高い物を残す（pass が無ければ `needs_review`）。

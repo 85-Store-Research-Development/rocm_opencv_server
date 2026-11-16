@@ -63,7 +63,8 @@ ROUGH_TOP = 0.45  # 輪郭を見る上の部分（マスクの高さに対する
 EDGE_DELTA_CHECK = 21.0  # 上の部分の境目の ΔE の中央値がこれ未満: 白い服 × 白い壁で境目が弱い
 ROUGH_CHECK = 0.0020  # 上の部分の輪郭のギザギザ（top_roughness）がこれ以上: 襟元などが欠けている
 # 境目が弱い（淡い色の服）だけでは外さない。欠けていない淡い服が多く、白い服が使えなくなるため。
-# 境目が弱い服は、ギザギザのしきい値を厳しくして見る（きれいな淡い服は 0.0005 以下・欠けた白Tは 0.0023。暫定）
+# 境目が弱い服は、ギザギザのしきい値を厳しくして見る
+# （きれいな淡い服は 0.0005 以下・欠けた白Tは 0.0023。暫定）
 ROUGH_CHECK_WEAK_EDGE = 0.0010
 
 # --- 判定のしきい値 ---
@@ -292,7 +293,8 @@ def grade(q: Quality) -> tuple[str, list[str]]:
     weak_edge = q.edge_delta < EDGE_DELTA_CHECK
     if weak_edge and ROUGH_CHECK_WEAK_EDGE <= q.roughness < ROUGH_CHECK:
         checks.append(
-            f"服と背景の境目が弱く（色の差 {q.edge_delta:.0f}）、輪郭も少し荒い（{q.roughness:.4f}）。欠けている疑い"
+            f"服と背景の境目が弱く（色の差 {q.edge_delta:.0f}）、"
+            f"輪郭も少し荒い（{q.roughness:.4f}）。欠けている疑い"
         )
     if q.roughness >= ROUGH_CHECK:
         checks.append(f"襟・肩のあたりの輪郭がギザギザ（{q.roughness:.4f}）。欠けている疑い")

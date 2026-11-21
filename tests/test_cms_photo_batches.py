@@ -165,3 +165,14 @@ def test_load_previews_does_not_hide_other_errors():
     photos, sources = _photos("a", "bad1")
     with pytest.raises(httpx.HTTPStatusError):
         batches.load_previews(photos, sources, FakeCms(status=500))
+
+
+def test_try_read_tags_keeps_the_groups_when_the_reader_fails(monkeypatch, capsys):
+    def boom():
+        raise MemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(batches, "open_tag_reader", boom)
+    items = [{"key": "g1"}]
+    batches.try_read_tags(items, [batches.Group()])
+    assert items == [{"key": "g1"}]
+    assert "タグは読めませんでした" in capsys.readouterr().out

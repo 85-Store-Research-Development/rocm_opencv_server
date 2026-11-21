@@ -444,6 +444,18 @@ def read_tags(reader, items: list[dict], groups: list[Group]) -> None:
         print(f"#{i} タグ: {reading_fields(reading)}", flush=True)
 
 
+def try_read_tags(items: list[dict], groups: list[Group]) -> None:
+    """タグを読んで案に足す。読めなくても（GPU のメモリ不足など）、分けた案はそのまま返す。"""
+    try:
+        reader = open_tag_reader()
+        if reader:
+            read_tags(reader, items, groups)
+            reader.close()
+    except Exception as e:  # noqa: BLE001 タグは無くても下書きは作れる（あとから --read-tags-batch で入れられる）
+        print(f"タグは読めませんでした（分けた案はそのまま返します）: {e}", flush=True)
+        release_gpu()
+
+
 def run_once(dry_run: bool, brand: bool) -> int:
     cms = Cms()
     queue = cms.queue()
@@ -463,10 +475,7 @@ def run_once(dry_run: bool, brand: bool) -> int:
         groups, garments = build_groups(model, batch, queue, cms, brand)
         del model  # Clef を GPU から下ろしてから、タグを読むモデルを載せる
         release_gpu()
-        reader = open_tag_reader()
-        if reader:
-            read_tags(reader, groups, garments)
-            reader.close()
+        try_read_tags(groups, garments)
     except Exception as e:  # noqa: BLE001 失敗は CMS に知らせて、人が自分で分けられるようにする
         if not dry_run:
             cms.error(batch["id"], f"Clef で分けられませんでした: {e}")

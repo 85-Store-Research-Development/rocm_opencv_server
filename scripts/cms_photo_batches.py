@@ -12,6 +12,7 @@
 - 1 分ごとに systemd のタイマー（deploy/cms-photo-batches.*）で起こす。
   分け待ちが無ければ Clef を読み込まずに終わる。GPU の空きが足りない（snoo などが使う）ときは、
   その回は見送る（まとまりは分け待ちのまま）
+- 縮小版を作れない写真（422。写真でないファイルが上がったとき）は飛ばして、残りを分ける
 - CMS の API（src/photo-intake/batch-endpoints.ts）: GET /api/photoBatches/queue →
   POST /:id/claim → POST /:id/result（失敗は /:id/error）。
   写真は CMS の縮小版（/api/photoSources/:id/preview。DNG も JPEG で来る）
@@ -311,6 +312,27 @@ class Cms:
         )
 
 
+def load_previews(photos: list[Photo], sources: list[dict], cms: Cms) -> list[Photo]:
+    """写真の縮小版を CMS から読む。縮小版を作れない写真（422。写真でないファイルなど）は飛ばす。
+
+    1 枚のためにまとまり全体を失敗にしない（飛ばした写真は、CMS が「未分類」にまとめる）。
+    1 枚も読めなければ失敗にする。
+    """
+    readable = []
+    for photo, source in zip(photos, sources, strict=True):
+        try:
+            photo.image = cms.preview(source["preview"])
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 422:
+                raise
+            print(f"  {photo.filename}: 縮小版を作れないので飛ばします", flush=True)
+            continue
+        readable.append(photo)
+    if not readable:
+        raise RuntimeError("読める写真が 1 枚もありません（写真でないファイルが上がっています）")
+    return readable
+
+
 def build_groups(
     model, batch: dict, choices: dict, cms: Cms, brand: bool
 ) -> tuple[list[dict], list[Group]]:
@@ -318,8 +340,8 @@ def build_groups(
         Photo(s["id"], s.get("filename") or "", parse_time(s.get("takenAt")))
         for s in batch["sources"]
     ]
-    for photo, source in zip(photos, batch["sources"], strict=True):
-        photo.image = cms.preview(source["preview"])
+    photos = load_previews(photos, batch["sources"], cms)
+    for photo in photos:
         label_photo(model, photo)
         print(
             f"  {photo.filename}: {photo.label}  ({photo.kind} "

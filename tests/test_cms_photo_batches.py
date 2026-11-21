@@ -1,5 +1,8 @@
 from datetime import UTC, datetime, timedelta
 
+import httpx2 as httpx
+import pytest
+
 from scripts import cms_photo_batches as batches
 
 START = datetime(2026, 11, 14, 2, 0, tzinfo=UTC)
@@ -122,3 +125,43 @@ def test_parse_time():
     )
     assert batches.parse_time(None) is None
     assert batches.parse_time("bad") is None
+
+
+class FakeCms:
+    """縮小版: bad を含む写真は 422、ほかは写真のバイト列。"""
+
+    def __init__(self, status: int = 422):
+        self.status = status
+
+    def preview(self, path: str) -> bytes:
+        if "bad" in path:
+            request = httpx.Request("GET", f"https://cms.test{path}")
+            raise httpx.HTTPStatusError(
+                "x", request=request, response=httpx.Response(self.status, request=request)
+            )
+        return b"jpeg"
+
+
+def _photos(*names: str):
+    photos = [batches.Photo(i, name, None) for i, name in enumerate(names, start=1)]
+    sources = [{"preview": f"/api/photoSources/{name}/preview?max=1280"} for name in names]
+    return photos, sources
+
+
+def test_load_previews_skips_photos_without_a_preview():
+    photos, sources = _photos("a", "bad1", "b")
+    readable = batches.load_previews(photos, sources, FakeCms())
+    assert [p.filename for p in readable] == ["a", "b"]
+    assert all(p.image == b"jpeg" for p in readable)
+
+
+def test_load_previews_fails_when_nothing_is_readable():
+    photos, sources = _photos("bad1", "bad2")
+    with pytest.raises(RuntimeError, match="読める写真"):
+        batches.load_previews(photos, sources, FakeCms())
+
+
+def test_load_previews_does_not_hide_other_errors():
+    photos, sources = _photos("a", "bad1")
+    with pytest.raises(httpx.HTTPStatusError):
+        batches.load_previews(photos, sources, FakeCms(status=500))

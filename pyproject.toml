@@ -74,3 +74,7 @@ explicit = true
 
 [tool.uv.sources]
 pillow = { index = "pypi" }
+
+[tool.ruff.lint.per-file-ignores]
+# プロンプトの長い行と、作業用フォルダから読み込むための import の位置
+"scripts/cms_descriptions/*" = ["E501", "E402"]

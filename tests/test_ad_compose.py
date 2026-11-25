@@ -28,7 +28,7 @@ def brief_raw(n=3, **over):
             "area_line": "テスト町",
         },
         "headline": "あたらしい服、\nとどいてます。",
-        "aside": "一点ものです",
+        "aside": "古着のシャツです",
         "palette": "navy",
         "items": [
             {
@@ -737,3 +737,21 @@ def test_cache_key_changes_with_cutout_rules_version(monkeypatch):
     a = ac.cache_key("u", None, "Shirts")
     monkeypatch.setattr(ac, "CUTOUT_CACHE_VERSION", ac.CUTOUT_CACHE_VERSION + 1)
     assert ac.cache_key("u", None, "Shirts") != a
+
+
+@pytest.mark.parametrize("fmt", ac.FORMATS)
+def test_no_aside_still_builds_checks_and_renders(fmt, tmp_path):
+    # aside（ひとこと）が無いブリーフでも組めて、検査を通り、描ける
+    ms = ac.Measurer(None)
+    raw = brief_raw(3)
+    del raw["aside"]
+    b = ac.parse_brief(raw)
+    assert b.aside == ""
+    verdicts = []
+    for seed in range(4):
+        lay = ac.build_layout(b, sprites(3, tmp_path), fmt, seed, ms)
+        assert not any(blk.name == "aside" for blk in lay.blocks)
+        verdicts.append(ac.check_layout(lay, ms).verdict)
+        html = ac.render_html(lay, tmp_path)
+        assert "古着のシャツです" not in html and 'class="b head"' in html
+    assert "pass" in verdicts

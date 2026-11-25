@@ -24,8 +24,8 @@ def single_raw(callouts=None, **over):
             "tagline": "ここで会いましょう。",
             "area_line": "テスト町",
         },
-        "headline": "この1点、\nもう出会えない。",
-        "aside": "一点もの",
+        "headline": "SAMPLE の\nネルシャツ。",
+        "aside": "古着です",
         "palette": "navy",
         "items": [
             {
@@ -37,7 +37,7 @@ def single_raw(callouts=None, **over):
         ],
         "single": {
             "price_text": "¥9,800",
-            "stamp": "1点もの",
+            "stamp": "USA製",
             "callouts": callouts
             if callouts is not None
             else [
@@ -89,7 +89,7 @@ MS = ac.Measurer(None)
 def test_parse_single_kinds_notes_and_problems():
     raw = {
         "price_text": "¥9,800",
-        "stamp": "1点もの",
+        "stamp": "USA製",
         "callouts": [{"kind": "brand", "text": "A"}, {"kind": "???", "text": "B"}]
         + [{"kind": "size", "text": f"S{i}"} for i in range(6)]
         + [{"kind": "size", "text": ""}],
@@ -301,7 +301,7 @@ def test_badge_is_placed_in_free_space_with_readable_size():
     assert np.count_nonzero(disc & blocked) <= sg.TOLERANCE_PX
     assert np.count_nonzero(disc & mask) / np.count_nonzero(disc) <= sg.BADGE_HERO_OVERLAP
     s = sg.place_stamp_tag(
-        "1点もの",
+        "USA製",
         b,
         hero_mask=mask,
         blocked=blocked,
@@ -458,3 +458,20 @@ def test_layout_collage_and_extra_keys_are_the_classic_collage():
             ac.Sprite(f"i{k}", f"ラベル{k}", Path("/x.png"), hero_sprite().alpha) for k in range(3)
         ]
         assert ac.build_layout(brief, sprites, "4:5", 0, MS).layout == "collage"
+
+
+def test_no_stamp_and_no_aside_still_build_check_and_render(tmp_path):
+    # 店の決まりで「1点もの」の札は付けない。stamp・aside が無くても組めて、描けて、検査を通る
+    for fmt in ac.FORMATS:
+        raw = single_raw()
+        del raw["single"]["stamp"], raw["aside"]
+        brief = ac.parse_brief(raw)
+        assert brief.aside == "" and brief.single.stamp is None
+        lay = ac.build_single_layout(brief, [hero_sprite()], fmt, 0, MS, None, None)
+        assert lay.single.badge is not None and lay.single.stamp is None
+        assert not any(b.name in ("aside", "stamp") for b in lay.blocks)
+        chk = ac.check_layout(lay, MS)
+        assert chk.verdict == "pass", (fmt, chk.problems)
+        lay.items[0].sprite.png_path = tmp_path / "hero.png"
+        html = ac.render_html(lay, tmp_path)
+        assert "¥9,800" in html and "古着です" not in html

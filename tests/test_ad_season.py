@@ -19,7 +19,7 @@ def raw(n=3, **over):
         "format": "4:5",
         "store": {"name": "SAMPLE", "tagline": "ここで会いましょう。", "area_line": "テスト町"},
         "headline": "あたらしい服、\nとどいてます。",
-        "aside": "一点もの",
+        "aside": "古着です",
         "palette": "navy",
         "items": [
             {"id": f"i{k}", "image": f"/x/{k}.jpg", "label": f"ブランド{k} の シャツ"}
